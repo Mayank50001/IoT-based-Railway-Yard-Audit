@@ -135,3 +135,12 @@ MOVEMENT_GAP_SECONDS = 20
 CLOSURE_SWEEP_SECONDS = 5
 PLAN_MATCH_WINDOW_MINUTES = 60
 VALIDATION_POLICY = 'RFID_PRIMARY_COUNTS_V4'
+
+# Device-key verification costs a PBKDF2 round (~1 s here), so a successful
+# check is cached briefly instead of being repeated per event in a batch.
+DEVICE_AUTH_CACHE_SECONDS = 60
+INGEST_MAX_BATCH_SIZE = 50
+
+REST_FRAMEWORK = {
+    'EXCEPTION_HANDLER': 'yard.api.exception_handler',
+}

@@ -26,9 +26,9 @@ Following `AGENTS.md`, application code is delivered in chat unless code-file ed
 | M0 — Foundation | Settings, UTC storage, `/health` endpoint, health tests | **VERIFIED** (2026-10-25, user-reported) |
 | M1 — Domain models | Stations, staff, devices, rolling stock, plans, assignments, movements, events, findings, inventory, alerts | **VERIFIED** (2026-10-25, applied and tested at the user's request) |
 | M1b — Seed data | Repeatable demo station, shared lane, fleet, three plans, initial lane mode | **VERIFIED** (2026-10-25, CP-03) |
-| M2 — Ingestion | Authenticated single/batch event endpoint, UID canonicalisation, idempotency | Planned |
-| M3 — Movement bucket | 20-second receive-time gap, lazy + sweep closure, idempotent close | Planned |
-| M4 — Validation | Direct/fallback plan match, distinct type counts, ultrasonic warning, findings | Planned |
+| M2 — Ingestion | Authenticated single/batch event endpoint, UID canonicalisation, idempotency | **VERIFIED** (2026-10-25, CP-04) |
+| M3 — Movement bucket | 20-second receive-time gap, idempotent closure, sweep command | **VERIFIED** for bucket mechanics (CP-04); closure finalisation waits on M4 |
+| M4 — Validation | Direct/fallback plan match, distinct type counts, ultrasonic warning, findings | Next (CP-06) |
 | M5 — Inventory & APIs | RFID-primary inventory, dashboard/history/alert endpoints | Planned |
 | M6 — Simulator | v4 acceptance scenarios through the real ingestion path | Planned |
 | M7 — Firmware | Final ESP32 `main.py` after the API contract is stable | Deferred |
@@ -131,6 +131,47 @@ Seeded plans:
 
 The bench plan is bound to the two tags the user physically owns, so a real two-unit demonstration is possible today. The 4-coach plans are for the simulator. Plan status is intentionally **not** reset on re-seed, because a plan already used by a movement must keep its lifecycle. `--reset` deletes demo movements, inventory, and plans for NDLS only; master data and the lane key survive.
 
+### M2/M3 — Ingestion and movement buckets (CP-04)
+
+The `event_id` contract was confirmed by the user's instruction to continue with the recommendation, so it is now fixed as `<device_id>-<boot_id>-<sequence>`.
+
+```text
+$ python manage.py test yard backend
+  Ran 50 tests in 1.451s
+  OK
+
+$ python manage.py check
+  System check identified no issues (0 silenced).
+
+$ python manage.py makemigrations --check --dry-run
+  No changes detected
+```
+
+An end-to-end smoke test ran through the real URL configuration against the seeded dev database, inside a rolled-back transaction (so the demo data stayed untouched). Batch of two events:
+
+```text
+batch 200
+{
+  "device_id": "gate-1",
+  "lane_mode": "ENTRY",
+  "accepted": 2,
+  "duplicates": 0,
+  "rejected": 0,
+  "results": [
+    {"status": "accepted", "rfid_uid": "FA37E63F", "rolling_stock": "WDM3A-1001",
+     "movement_id": 1, "movement_created": true},
+    {"status": "accepted", "kind": "PHYSICAL_PASSAGE", "movement_id": 1,
+     "movement_created": false}
+  ]
+}
+retry 200 {'status': 'duplicate', 'movement_id': 1, ...}
+wrong key 401 {'detail': 'Device credentials were not accepted.', 'code': 'DEVICE_AUTH_FAILED'}
+```
+
+Note the canonicalisation in that run: the request sent `fa:37:e6:3f` and the response echoed `FA37E63F`, resolved to `WDM3A-1001`.
+
+New tests (24 in `yard/test_ingest.py`) cover: missing/wrong credentials, unknown and disabled devices, the auth cache and key rotation, unset lane mode, spoofed `device_id`, canonicalisation, unknown UIDs, the `kind` alias, passage metadata, duplicate retries, cross-device `event_id` conflict, per-event batch outcomes, oversized and malformed envelopes, the exact 20-second boundary, closure over 20 seconds, mode changes mid-consist, and the idle sweep.
+
 ---
 
 ## 4. Decision register
@@ -142,7 +183,7 @@ The bench plan is bound to the two tags the user physically owns, so a real two-
 | D-03 | Ultrasonic disagreement is a movement-level `WARN`, not a validation failure | A complete, otherwise valid RFID composition should not be failed by an advisory sensor. | Pairing-dependent validation. |
 | D-04 | Plan lookup: lead-locomotive RFID first, unambiguous coach-to-plan assignment second | A coach can carry its plan context when the loco tag is missed, without inventing a loco read. | Requiring the loco read; or guessing among conflicting assignments. |
 | D-05 | Expected/inferred locomotive data is stored separately from observed evidence | A database lookup is not a detection. Conflating them would create fake observations and fake inventory transitions. | Treating the expected loco as observed. |
-| D-06 | One `OPEN` movement per `(station, direction, device)`, enforced by a partial unique constraint | Concurrency-safe invariant: two simultaneous ingestion requests cannot open two buckets. Declared in the database, not only in Python. | Application-only check (race window). |
+| D-06 | One `OPEN` movement per lane, enforced by a partial unique constraint | Concurrency-safe invariant: two simultaneous ingestion requests cannot open two buckets. Declared in the database, not only in Python. The key started as `(station, direction, device)` and was narrowed to `(device,)` by D-21. | Application-only check (race window). |
 | D-07 | One movement per bound plan, enforced by a conditional unique constraint | v4 rule; prevents one plan being consumed twice. | Application-only check. |
 | D-08 | `event_id` is `CharField(max_length=64)`, not `UUIDField` | The firmware event-id format is not fixed yet. A UUID field would reject valid device ids and force firmware changes. Same string on retry still gives idempotency. | `UUIDField` (premature contract). |
 | D-09 | Device API keys stored with Django's password hasher (`make_password` / `check_password`) | A leaked database should not reveal working gate credentials. | Plaintext key column. |
@@ -158,6 +199,11 @@ The bench plan is bound to the two tags the user physically owns, so a real two-
 | D-19 | Direction is an explicit, audited operator choice — never inferred from inventory state | Inference creates a feedback loop: direction comes from inventory, inventory is updated by direction. One missed read then inverts a unit permanently, and a consist with mixed/stale states splits into two movements. | Per-unit OUT→IN / IN→OUT flip on each read. |
 | D-20 | `lane_mode_changes` is append-only; each movement links to the exact change that authorised it | Answers "who declared this an entry?" without trusting the device payload. Mode history cannot be rewritten from the admin. | Storing only the current mode on the device. |
 | D-21 | Open-movement uniqueness is per device, not per `(station, direction, device)` | A mode change mid-consist must not open a second bucket on the same lane. The open movement keeps its direction; the new mode starts with the next movement. | Including direction in the lane key. |
+| D-22 | One transaction per event; per-event results; whole-request rejection only for credentials, envelope, identity claims, or lane mode | A single malformed event must not poison a queue: rejecting the batch would make the firmware retry it forever. Conversely, a spoofed `device_id` or an unset lane is not a per-event accident, and must store nothing at all. | All-or-nothing batches (poison batch); best-effort batches without a spoof check (half-applied spoof). |
+| D-23 | Device-key verification cached for 60 s, keyed by a SHA-256 of `(device_id, key)` and fingerprinted with the stored hash | PBKDF2 costs ~1.3 s. Caching the *outcome* keeps a 50-event batch fast; storing the hash fingerprint makes key rotation invalidate the cache immediately without a purge. | Re-hashing per event; caching the raw key. |
+| D-24 | `event_id` contract is `<device_id>-<boot_id>-<sequence>`; the server enforces global uniqueness and treats cross-device reuse as 409 | `boot_id` survives a reboot only if the firmware persists it with the queue, which is exactly what makes a retried event keep its id. Global uniqueness also catches two boards provisioned with the same sequence space. | Server-assigned ids (breaks offline queueing); timestamp-only ids (need a synced clock). |
+| D-25 | Closure mechanics are separate from validation; a closed movement keeps `validation_result = NULL` plus an INFO `VALIDATION_PENDING` finding until CP-06 | Closing a bucket must not require the validation service to exist, but the gap must be visible. NULL honestly means "not validated", and CP-06 can find every such movement and replace the findings atomically. | Marking closed movements `VALID` by default (lies); `UNVERIFIED` by default (wrong meaning). |
+| D-26 | A batch shares one server receive instant, and `last_evidence_at` never moves backwards | A firmware queue drain arrives as one request; giving each event its own increasing timestamp would let a drain straddle a bucket boundary artificially. The backwards guard absorbs clock corrections and late replay. | Per-event wall clock inside a batch; overwriting `last_evidence_at` unconditionally. |
 
 ---
 
@@ -217,19 +263,39 @@ The user selected "lane mode + operator selection" from three options after the 
 
 Command options: `--api-key` (set a known key), `--rotate-key` (generate and print a new one), `--reset` (delete demo movements/inventory/plans for NDLS). Re-running without `--reset` never duplicates rows.
 
+## 6c. Checkpoint CP-04 — ingestion and buckets
+
+| File | Change | Purpose |
+|---|---|---|
+| `backend/yard/auth.py` | new | `authenticate_device()`: header parsing, hashed-key verification, 60 s success cache invalidated by hash rotation |
+| `backend/yard/exceptions.py` | new | Typed API errors with stable codes (`LANE_MODE_NOT_SET`, `DEVICE_INACTIVE`, `EVENT_ID_DEVICE_MISMATCH`, …) |
+| `backend/yard/serializers.py` | new | Event wire format: `event_type`/`kind`, `event_id` pattern, UID canonicalisation, passage metadata, per-field error codes |
+| `backend/yard/ingest.py` | new | Per-event transaction: duplicate resolution, rolling-stock lookup, storage, typed result |
+| `backend/yard/movements.py` | new | Bucket assignment (gap, mode capture, monotonic evidence), idempotent `close_movement()`, `close_idle_movements()` |
+| `backend/yard/views.py` | replaced stub | `POST /api/ingest/events`: envelope handling, identity-claim pre-check, per-event results, `last_seen_at` |
+| `backend/yard/urls.py`, `backend/backend/urls.py` | new/edit | `/api/ingest/events` (with and without trailing slash) |
+| `backend/yard/api.py` | new | DRF exception handler that exposes `code` in the response body |
+| `backend/yard/clock.py` | new | `server_now()` so tests control receive time without sleeping |
+| `backend/yard/management/commands/sweep_movements.py` | new | Periodic closure of idle movements |
+| `backend/yard/test_ingest.py` | new | 24 ingestion/bucket tests |
+| `backend/backend/settings.py` | edit | `DEVICE_AUTH_CACHE_SECONDS`, `INGEST_MAX_BATCH_SIZE`, DRF exception handler |
+
+No migration was needed: the CP-02 schema already carried every field ingestion writes.
+
+A captured batch shares one receive instant. If the clock reports an event older than the lane's last evidence, `last_evidence_at` is left alone rather than moved backwards.
+
 ---
 
-## 7. Verification status of CP-02 and CP-02b
+## 7. Verification status (current)
 
 ```bash
 cd backend
-python manage.py makemigrations yard
-python manage.py migrate
+python manage.py makemigrations --check --dry-run
 python manage.py test yard backend
 python manage.py check
 ```
 
-Result: migrations `0001_initial` and `0002_lanemodechange_and_more` applied; 20 `yard` tests and the 3 pre-existing health tests pass; `check` reports no issues.
+Result: migrations `0001_initial` and `0002_lanemodechange_and_more` are the whole schema; `yard` (47 tests) plus the 3 pre-existing health tests all pass; `check` reports no issues and no migrations are pending.
 
 Then create a superuser and confirm the models appear in `/admin/`:
 
@@ -245,27 +311,28 @@ python manage.py runserver
 | Item | State |
 |---|---|
 | Plan reassignment after a wrong bind | Open. A plan may bind to only one movement; the yard master currently has no UI/endpoint to release it. |
-| Firmware `event_id` format | Open. Must be stable across retries; the server accepts any string up to 64 characters. |
-| API-key rotation | Open. Hashing is in place; rotation endpoint comes with ingestion. |
+| Firmware `event_id` format | **Closed (D-24):** `<device_id>-<boot_id>-<sequence>`. The firmware must persist `boot_id` alongside the queue so a retried event keeps its id. |
+| API-key rotation | Hashing and cache invalidation are in place; `seed_demo --rotate-key` and the admin form both work. A dedicated dashboard action belongs in CP-07. |
 | `ALLOWED_HOSTS` for ESP32 on LAN | Configured via `DJANGO_ALLOWED_HOSTS`; the concrete LAN IP is not yet fixed. |
-| Closure sweep runner | Movement closure needs a periodic trigger (management command + cron, or a small loop) in addition to lazy checks. |
+| Closure sweep runner | `python manage.py sweep_movements` exists and is idempotent. A scheduler (cron, systemd timer, or a thread in the demo server) still has to run it. |
 | SQLite concurrency | Prototype-acceptable. Enable WAL if ingestion and the dashboard run together under load. |
-| Device key verification cost | ~1.3 s per PBKDF2 check. CP-04 must authenticate once per request and cache successful verifications; otherwise batch ingestion becomes slow. |
+| Device key verification cost | Mitigated: one PBKDF2 check per key per 60 s, then cached (D-23). |
+| Auth cache across processes | The default locmem cache is per process. With multiple workers, each pays one verification per key per minute; that is acceptable here, and a shared cache fixes it if workers multiply. |
 | Scaffold/version drift | Settings header says Django 4.2.16; the environment actually runs 6.1.2. Code now targets the installed version. Re-check on any environment rebuild. |
 | UID length variety | Canonical form accepts 4–32 hex characters (2–16 bytes) in whole bytes; RC522 4-byte tags are the current case. |
+| Closed movements awaiting validation | Every movement closed by CP-04 carries `validation_result = NULL` and an INFO `VALIDATION_PENDING` finding. CP-06 must validate these too, not only newly closing ones. |
 | Revalidation of a closed movement | Policy defined (replace findings atomically, never repeat inventory transitions); implementation still to come. |
 | Inventory-inferred direction | **Rejected by decision D-19.** Never implemented. Only a `DIRECTION_CONFLICT` warning will consult inventory state. |
-| Lane mode unset | Ingestion will refuse events with HTTP 409 `LANE_MODE_NOT_SET`; the firmware queue must retain and retry them. Not yet implemented. |
+| Lane mode unset | **Implemented:** HTTP 409 `LANE_MODE_NOT_SET`, nothing stored. The firmware queue must retain and retry. |
 | Mode change during a backlog drain | A late batch can be ingested after the operator changed the lane mode, giving it the new direction. Same class of problem as delayed replay; mitigate by closing the movement before switching modes. |
 | Operator ergonomics | Setting the mode is currently an admin action. A dedicated dashboard control/API belongs in CP-07. |
+| Lazy closure on read | The sweep closes idle movements; ingestion also rotates a bucket immediately when a later event exceeds the gap. A dashboard read path still has no lazy-close hook (CP-07). |
 
 ---
 
 ## 9. Next checkpoints
 
-1. **CP-04 — ingestion:** authenticated single/batch endpoint with transactional dedup, UID resolution, and `LANE_MODE_NOT_SET` handling.
-2. **CP-05 — movement buckets:** 20-second receive-time segmentation and idempotent closure.
-3. **CP-06 — validation:** plan direct/fallback matching, count checks, ultrasonic warning, `DIRECTION_CONFLICT`, findings.
-4. **CP-07 — inventory & APIs:** presence updates and station-scoped read APIs, including the operator lane-mode control.
-5. **CP-08 — simulator:** acceptance scenarios through the real ingestion path.
-6. **CP-09 — firmware:** final ESP32 `main.py` after the contract is stable.
+1. **CP-06 — validation:** plan direct/fallback matching, distinct type counts, ultrasonic warning, `DIRECTION_CONFLICT`, findings, and validating the movements CP-04 already closed with `VALIDATION_PENDING`.
+2. **CP-07 — inventory & APIs:** presence updates and station-scoped read APIs, including the operator lane-mode control.
+3. **CP-08 — simulator:** acceptance scenarios through the real ingestion path.
+4. **CP-09 — firmware:** final ESP32 `main.py` after the contract is stable.

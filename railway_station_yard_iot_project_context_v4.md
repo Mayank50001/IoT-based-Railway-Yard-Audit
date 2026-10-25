@@ -64,6 +64,76 @@ Device sensing timestamps and passage entry/exit metadata remain useful audit da
 
 Store timestamps in UTC and display IST on the dashboard. Do not label an unsynchronised clock as UTC. Delayed queue replay can still distort receive-time movement segmentation; this inherited prototype limitation is not solved by changing the counting policy.
 
+### Device event contract
+
+```text
+POST /api/ingest/events
+X-Device-ID: gate-1
+X-Api-Key: <device key>
+Content-Type: application/json
+```
+
+The body is either one event object or `{"events": [...]}` with at most 50 events. One batch shares a single server receive instant, so events drained from the firmware queue during one request cannot straddle a bucket boundary.
+
+```json
+{
+  "event_id": "gate-1-7f3a2c-000042",
+  "event_type": "RFID_DETECTED",
+  "device_id": "gate-1",
+  "timestamp": "2026-10-25T09:30:08.120Z",
+  "sequence": 42,
+  "rfid_uid": "FA37E63F"
+}
+```
+
+```json
+{
+  "event_id": "gate-1-7f3a2c-000043",
+  "event_type": "PHYSICAL_PASSAGE",
+  "device_id": "gate-1",
+  "timestamp": "2026-10-25T09:30:09.400Z",
+  "sequence": 43,
+  "metadata": {
+    "started_at": "2026-10-25T09:30:09.400Z",
+    "ended_at": "2026-10-25T09:30:09.850Z",
+    "duration_ms": 450,
+    "min_distance_cm": 8,
+    "peak_distance_cm": 41
+  }
+}
+```
+
+`event_id` is generated once per logical event and reused on every retry. The contract is:
+
+```text
+<device_id>-<boot_id>-<sequence>
+```
+
+`boot_id` is a short random string created at firmware start and persisted with the queue, so a queued event keeps its identifier across a reboot. `sequence` is a monotonically increasing counter. `event_id` is globally unique on the server; the same value arriving from a different device is a conflict, not a retry.
+
+`event_type` is the documented field name. `kind` is accepted as an alias for compatibility with earlier scripts. `device_id` is optional and, when present, must match the authenticated device.
+
+Per-event result statuses:
+
+| Status | Meaning | Firmware action |
+|---|---|---|
+| `accepted` | Stored and assigned to a movement | Delete from queue |
+| `duplicate` | Same `event_id` already stored; returns the original movement | Delete from queue |
+| `rejected` | Permanently invalid event, with `error.code` | Delete from queue and log; retrying cannot help |
+
+Whole-request failures mean nothing was stored:
+
+| HTTP | Code | Meaning |
+|---|---|---|
+| 400 | `PARSE_ERROR` | Malformed JSON or envelope |
+| 401 | `DEVICE_AUTH_REQUIRED` / `DEVICE_AUTH_FAILED` | Missing or wrong credentials; fix provisioning |
+| 403 | `DEVICE_INACTIVE` | Device disabled by an operator |
+| 403 | `DEVICE_ID_MISMATCH` | Payload claims a different device; fix firmware |
+| 409 | `LANE_MODE_NOT_SET` | Retryable: wait for an operator to select the lane mode |
+| 409 | `EVENT_ID_DEVICE_MISMATCH` | Another device already used this `event_id`; investigate |
+
+HTTP 200 means the request was processed; per-event statuses carry the outcome. A batch can therefore contain accepted, duplicate, and rejected events at once, so one bad payload in the queue does not block the rest.
+
 ## 4. Counting rules
 
 | Quantity | Definition |
@@ -250,6 +320,9 @@ Unless otherwise stated, use a plan expecting **1 lead locomotive + 4 coaches**.
 | Events arrive on a lane whose mode is unset | HTTP 409 `LANE_MODE_NOT_SET`; no movement, no event counted, no inventory change |
 | Operator switches the lane mode while a movement is open | Open movement keeps its original direction; the new mode applies to the next movement |
 | Operator sets `ENTRY` while most observed units are already `IN_YARD` | Movement stays `ENTRY`; `DIRECTION_CONFLICT` warning; inventory is not auto-flipped |
+| Duplicate `event_id` sent again after a lost response | HTTP 200, `duplicate` status, one stored event, no second movement assignment |
+| One malformed event inside a batch | That event is `rejected` with a code; the rest are accepted; the queue is not blocked |
+| Same `event_id` sent by a different device | HTTP 409 `EVENT_ID_DEVICE_MISMATCH`; nothing is stored |
 | Same physical lane used for an entry and later an exit | One device record; two movements with different directions; both auditable to their `lane_mode_change` |
 
 Also test UID normalization, spoofed station/direction fields, disabled devices, exact 20-second boundaries, closure without future events, alert deduplication, and revalidation without repeated inventory transitions.
@@ -278,7 +351,9 @@ Backend defaults:
 - `movement_gap_seconds = 20`;
 - `closure_sweep_seconds = 5`;
 - `plan_match_window_minutes = 60`;
-- `validation_policy = RFID_PRIMARY_COUNTS_V4`.
+- `validation_policy = RFID_PRIMARY_COUNTS_V4`;
+- `device_auth_cache_seconds = 60`;
+- `ingest_max_batch_size = 50`.
 
 Firmware retains configurable ultrasonic filtering, threshold/hysteresis, minimum occupied/clear intervals, RFID cooldown, and bounded queue/retry settings. A starting same-UID absence/cooldown is 3 seconds; refresh its last-seen time on every successful raw read.
 

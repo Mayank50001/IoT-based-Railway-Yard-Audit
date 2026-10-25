@@ -1,7 +1,7 @@
 # Railway Yard IoT — Hardware Progress and Backend Session Handoff
 
 **Updated:** 2026-10-25  
-**Next task:** Build CP-04 authenticated ingestion (`POST` single/batch events, idempotent `event_id`, canonical UIDs, lane-mode check). Then movement buckets, validation, inventory, and simulation. Progress is tracked in the [Backend Implementation Log](railway_station_yard_iot_backend_implementation_log.md).
+**Next task:** Build CP-06 RFID-primary validation (plan direct/fallback matching, distinct type counts, ultrasonic warning, `DIRECTION_CONFLICT`, stored findings, and validating the movements CP-04 closed with `VALIDATION_PENDING`). Ingestion (`POST /api/ingest/events`) and movement buckets are implemented and tested. Progress is tracked in the [Backend Implementation Log](railway_station_yard_iot_backend_implementation_log.md).
 
 > Read this handoff first, then [RFID-Primary Specification — v4](railway_station_yard_iot_project_context_v4.md). Use v3 only for compatible background details, not its superseded mandatory-pairing/paired-inventory rules. Progress, decisions, and verification steps are recorded in the [Backend Implementation Log](railway_station_yard_iot_backend_implementation_log.md) — check it before starting work. This handoff records reported hardware results and the latest implementation direction; it is not a claim that the assistant independently ran the hardware tests or implemented the backend.
 
@@ -142,7 +142,7 @@ Fixed track constrains physical order, but does not guarantee successful RFID re
 - Convert completed occupied intervals into `PHYSICAL_PASSAGE` events.
 - Preserve both streams even if their counts disagree; do not emit only correlated evidence.
 - Retain passage entry/exit timestamps and duration metadata.
-- Generate unique event IDs and per-boot monotonic sequence numbers.
+- Generate unique event IDs in the contract `<device_id>-<boot_id>-<sequence>`, with `boot_id` persisted across reboots.
 - Connect to Wi-Fi, authenticate, queue events, and retry without blocking sensing.
 
 The eventual `main.py` will control sampling, filtering, cooldown, and transport. It must **not fabricate events, force the two counts to agree, infer business validity, or discard discrepancies**.
@@ -160,6 +160,37 @@ The eventual `main.py` will control sampling, filtering, cooldown, and transport
 Equal totals alone are not proof of correct composition. For a planned N-unit demonstration, count distinct known units by type, not raw RFID observations. Complete, otherwise valid RFID composition can remain `VALID` with an ultrasonic warning. Unknown tags, an absent expected locomotive RFID, wrong composition, or no usable plan can still prevent `VALID`.
 
 For a bench test or simulator, the manually known/generated input is ground truth. During operation, the backend has observed evidence and expected plan data; it does not possess an independent measurement of the actual number of units.
+
+### Ingestion contract (implemented in CP-04)
+
+```text
+POST /api/ingest/events
+X-Device-ID: gate-1
+X-Api-Key: <device key>
+```
+
+Body: one event object or `{"events": [...]}` (max 50). One batch shares a single server receive instant.
+
+```text
+event_id   = <device_id>-<boot_id>-<sequence>     e.g. gate-1-7f3a2c-000042
+event_type = RFID_DETECTED | PHYSICAL_PASSAGE     ("kind" accepted as an alias)
+timestamp  = device clock, optional audit data
+sequence   = per-boot counter
+rfid_uid   = required for RFID_DETECTED, forbidden for PHYSICAL_PASSAGE
+metadata   = passage started_at/ended_at/duration_ms and distance readings
+```
+
+`boot_id` is a short random string generated at firmware start and **persisted with the queue**, so an event queued before a reboot keeps its identifier. The server enforces global `event_id` uniqueness; the same id from a different device is a 409 conflict, not a retry.
+
+Retry rules for firmware:
+
+- `accepted` or `duplicate` — delete the event from the queue.
+- `rejected` with an `error.code` — delete it and log; the payload will never succeed.
+- HTTP 409 `LANE_MODE_NOT_SET` — keep the queue and retry after an operator selects the lane mode.
+- HTTP 401/403 — stop and fix provisioning; retrying will not help.
+- HTTP 400 — fix the firmware payload.
+
+Unknown UIDs are accepted and stored as evidence; the backend decides at closure that they are `UNKNOWN_RFID`.
 
 ### Clock and retry requirements for later firmware
 
@@ -199,7 +230,7 @@ Use a modular monolith. Do not introduce microservices, railway control, long-ra
 
 ### Current repository state
 
-The project contains the v2/v3/v4 specifications, this handoff, `AGENTS.md`, the existing `env/`, and the Django project at `backend/`. The `yard` app now contains the domain models, admin, lane-mode audit, demo seed command, and tests; migrations `0001` and `0002` are applied. Ingestion endpoints, movement construction, and validation services are **not** implemented yet. See the implementation log for the verified state.
+The project contains the v2/v3/v4 specifications, this handoff, `AGENTS.md`, the existing `env/`, and the Django project at `backend/`. The `yard` app now contains the domain models, admin, lane-mode audit, demo seed command, device-authenticated ingestion, movement buckets, and 47 tests; migrations `0001` and `0002` are applied. Validation, inventory transitions, and dashboard/read APIs are **not** implemented yet. See the implementation log for the verified state and the CP-04 file inventory.
 
 Investigate the existing environment before using or replacing it. Preserve unfamiliar files and any user work. The current hardware scripts live outside the supplied repository context; do not claim to have inspected them.
 
@@ -209,9 +240,9 @@ Use v4 for the current policy, model changes, scenarios, and implementation orde
 
 1. **Django foundation (adapt M0):** inspect the environment, establish project/configuration, timezone-aware UTC storage, SQLite, tests, and `GET /health` with database status and movement-gap configuration.
 2. **Domain model and seed data (M1):** stations, users, registered devices, rolling stock, plans/current plan assignments, movements, events, findings, inventory, and alerts. Enforce the retained unique/index constraints; no pairing observation table is required.
-3. **Ingestion (M2):** `POST /api/ingest/events`, device-key authentication, single-event/small-batch support, UID normalization, event validation, transactional storage, and idempotent duplicate handling. A duplicate event returns HTTP 200 without assigning/counting it again.
-4. **Movement construction (M3):** one OPEN movement per device, gap <= 20 seconds remains the same movement, gap > 20 seconds starts another, and idempotent sweep plus lazy closure. Direction is captured from the lane mode at bucket open.
-5. **RFID-primary validation (M4):** direct/fallback plan lookup, distinct known composition, aggregate ultrasonic warnings, stored findings, alerts, and idempotent revalidation. Do not implement greedy or order-preserving sensor pairing.
+3. **Ingestion (M2) — done in CP-04:** `POST /api/ingest/events`, `X-Device-ID` + `X-Api-Key`, single-event/small-batch support (50 max), UID normalization, per-event validation results, transactional storage, and idempotent duplicate handling. Duplicate events return HTTP 200 with the original movement and are not assigned or counted again.
+4. **Movement construction (M3) — done in CP-04:** one OPEN movement per device, gap <= 20 seconds remains the same movement, gap > 20 seconds starts another, idempotent `sweep_movements` command. Direction is captured from the lane mode at bucket open. Closing currently marks the movement and adds an INFO `VALIDATION_PENDING` finding; validation fills the result in M4.
+5. **RFID-primary validation (M4) — next:** direct/fallback plan lookup, distinct known composition, aggregate ultrasonic warnings, stored findings, alerts, and idempotent revalidation, including movements already closed with `VALIDATION_PENDING`. Do not implement greedy or order-preserving sensor pairing.
 6. **Inventory and APIs (M5):** update distinct actually read UIDs at closure without requiring ultrasonic pairs, retain unknown UIDs as unverified, handle unexpected exits, and scope dashboard/admin access appropriately. Missing/inferred locomotive UIDs must not generate observations or new inventory transitions.
 7. **Simulator/dashboard (M6 and supporting work):** use the same ingestion endpoint and event schema for the v4 acceptance scenarios. Adapt older scenarios to the revised warning/inventory policy. The backend must be fully demonstrable without physical hardware.
 8. **Final ESP32 firmware (M7):** provide the requested complete `main.py` against the stable API contract; confirm GPIOs/electrical details and preserve existing boot files before deployment.
@@ -249,10 +280,10 @@ Obtain these later; they do not block simulator-based backend development:
 - Final detection/clear thresholds, filtering, occupied/clear durations, timeout policy, and cooldown behaviour.
 - Wi-Fi connection/reconnection results; credentials should not be put in project documentation or logs.
 - Registered device ID, API URL, and secure provisioning of its key.
-- UTC clock strategy, bounded queue/overflow behaviour, and reboot/event-ID handling.
+- UTC clock strategy, bounded queue/overflow behaviour, and boot-id persistence in the queue.
 
 Do not force card detections into pairs in firmware. Preserve the actual independent observations so the backend can expose count/identity discrepancies under v4.
 
 ## 11. Suggested prompt for the next session
 
-> Read `AGENTS.md`, `railway_station_yard_iot_backend_handoff.md`, `railway_station_yard_iot_project_context_v4.md`, and `railway_station_yard_iot_backend_implementation_log.md`. My ESP32/RC522/ultrasonic bench tests are reported passing with separated sensors. Continue the existing Django project using RFID-primary distinct UID/type counts, aggregate ultrasonic warnings, coach-based plan lookup, and RFID-primary inventory. Devices are physical lanes with an audited operator-selected `lane_mode`; do not infer direction from inventory state. Do not implement per-unit pairing or fabricate a missed locomotive read. Preserve compatible v3 authentication, transport, station, and movement-gap rules. Next: seed data, then tested ingestion, movement construction, validation, inventory, and simulation. Do not generate ESP32 firmware yet.
+> Read `AGENTS.md`, `railway_station_yard_iot_backend_handoff.md`, `railway_station_yard_iot_project_context_v4.md`, and `railway_station_yard_iot_backend_implementation_log.md`. My ESP32/RC522/ultrasonic bench tests are reported passing with separated sensors. Continue the existing Django project using RFID-primary distinct UID/type counts, aggregate ultrasonic warnings, coach-based plan lookup, and RFID-primary inventory. Devices are physical lanes with an audited operator-selected `lane_mode`; do not infer direction from inventory state. Do not implement per-unit pairing or fabricate a missed locomotive read. Ingestion (`POST /api/ingest/events`, contract `<device_id>-<boot_id>-<sequence>`) and movement buckets are already implemented and tested. Next: CP-06 validation, including movements already closed with `VALIDATION_PENDING`, then inventory and read APIs, then the simulator. Do not generate ESP32 firmware yet.
