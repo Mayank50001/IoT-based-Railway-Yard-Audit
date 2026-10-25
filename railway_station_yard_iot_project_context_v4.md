@@ -27,18 +27,32 @@ This is a passive, hand-operated tabletop monitoring/auditing prototype. It does
 ## 2. What remains unchanged
 
 - A registered device belongs to one station. Inventory is station-level; there is no separate `yard_id`.
-- Station and `ENTRY`/`EXIT` direction come from the authenticated device record, not from the request payload.
-- This revision does **not** authorize changing to inventory-inferred, bidirectional operation. Existing registered direction remains the implementation baseline until that separate decision is made.
+- A device is a **physical lane**, not an entry-only or exit-only gate. Its operating direction is the lane mode chosen by an authenticated operator, recorded with who chose it and when.
+- Station comes from the authenticated device record. Direction comes from the lane mode captured on the movement when its bucket opens. Neither is trusted from the device payload.
+- Inventory state is **never** used to infer movement direction. It is an output of validated movements and an input only to warnings such as `UNEXPECTED_EXIT`.
 - Device API keys and yard-master authentication are separate. Dashboard requests are scoped to the user's station.
 - Events are stored transactionally and deduplicated by globally unique `event_id`. Retrying an event returns HTTP 200 without counting or assigning it again.
-- The ESP32 senses, filters, timestamps, queues, and transmits independent events. It does not decide plans, counts, inventory, validation, or movement boundaries.
+- The ESP32 senses, filters, timestamps, queues, and transmits independent events. It does not decide plans, counts, inventory, validation, movement boundaries, or direction.
 - Preserve unfamiliar project files and follow `AGENTS.md`: code is provided in chat unless the human explicitly authorizes code-file edits; ask before accessing files outside the project.
 
 Previous inventory state is useful for identifying unexpected exits or repeated entries. It must not silently turn an incoming observation into an exit, or vice versa.
 
-## 3. Movement buckets and timing
+## 3. Lanes, lane mode, and movement buckets
 
-There is at most one `OPEN` movement per `(station_id, direction, device_id)`.
+One station may have one shared gate or several separate gates. A `device` record represents one physical crossing lane; it is not permanently an entry gate or an exit gate.
+
+### Lane mode
+
+1. Each lane has a current `lane_mode` of `ENTRY`, `EXIT`, or unset.
+2. An authenticated operator sets the mode before passing stock. Every change is appended to `lane_mode_changes` with `set_by`, `changed_at`, and an optional note. History is never edited.
+3. Ingestion **rejects** events for a lane whose mode is unset (HTTP 409, `LANE_MODE_NOT_SET`). It does not guess, default, or create a movement without a direction. The firmware queue retains the events and retries.
+4. The mode applies to the **next** movement opened on that lane. An already-open movement keeps the direction it was opened with, even if the operator changes the mode mid-consist.
+5. The movement stores its `direction`, a `direction_source` (`OPERATOR` now; `PLAN` and `INFERRED` are reserved), and the exact `lane_mode_change` row that authorised it. The audit trail therefore answers "who said this was an entry?"
+6. Inventory state must not contradict the chosen mode silently. If most observed units are already in the state that contradicts the mode, the movement is flagged `DIRECTION_CONFLICT` for review. Nothing is auto-flipped, and no second direction is opened mid-movement.
+
+If the operator forgets to switch modes, the result is a clearly attributable wrong direction (an audited mode plus inventory warnings), not a compounding inversion of every future movement. This is the accepted cost of not inferring direction from stock state.
+
+There is at most one `OPEN` movement per device. Direction is part of the movement, not part of the lane key.
 
 1. **Any accepted event can start a movement**, including a coach RFID read or an ultrasonic passage. A locomotive read is not required to open the bucket.
 2. Use server `received_at` for segmentation and update `last_evidence_at` on every assigned event.
@@ -203,7 +217,10 @@ Changes for v4:
 - Keep expected locomotive information separate from actually observed locomotive information.
 - Derive distinct UID/type counts from stored RFID events. A separate per-observation pairing table is not required.
 - Do not implement `paired_passage_event_id`, a pairing service, or a backend pairing-window setting.
-- Retain audit events, event-id uniqueness, one open movement per device/direction/station, one movement per bound plan, station-scoped inventory uniqueness, and alert deduplication.
+- Model the gate as a lane: `device.lane_mode` holds the operator-selected direction, and `lane_mode_changes` is an append-only audit of who changed it, when, and why.
+- Record `direction`, `direction_source`, and the authorising `lane_mode_change` on every movement.
+- Enforce one open movement **per device**, one movement per bound plan, station-scoped inventory uniqueness, event-id uniqueness, and alert deduplication.
+- Do not enforce a fixed entry/exit classification on devices, and do not add an editable `entered`/`exited` pair to rolling stock.
 
 The event contract remains `RFID_DETECTED` / `PHYSICAL_PASSAGE`, with `event_id`, `device_id`, `sequence`, device timestamp, UID where applicable, and passage metadata. No firmware change is needed merely to make the backend count distinct UIDs instead of pairing events.
 
@@ -230,6 +247,10 @@ Unless otherwise stated, use a plan expecting **1 lead locomotive + 4 coaches**.
 | Coaches point to conflicting eligible plans | Flag the ambiguity; do not arbitrarily choose a fallback plan |
 | EXIT for observed stock never recorded inside | `FLAGGED` with `UNEXPECTED_EXIT`; recorded as `OUT` and unverified |
 | Plan expects 2 locos + 4 coaches, all read, 6 passages | `VALID` when lead identity and other required checks pass |
+| Events arrive on a lane whose mode is unset | HTTP 409 `LANE_MODE_NOT_SET`; no movement, no event counted, no inventory change |
+| Operator switches the lane mode while a movement is open | Open movement keeps its original direction; the new mode applies to the next movement |
+| Operator sets `ENTRY` while most observed units are already `IN_YARD` | Movement stays `ENTRY`; `DIRECTION_CONFLICT` warning; inventory is not auto-flipped |
+| Same physical lane used for an entry and later an exit | One device record; two movements with different directions; both auditable to their `lane_mode_change` |
 
 Also test UID normalization, spoofed station/direction fields, disabled devices, exact 20-second boundaries, closure without future events, alert deduplication, and revalidation without repeated inventory transitions.
 

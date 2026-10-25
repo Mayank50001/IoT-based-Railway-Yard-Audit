@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/4.2/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -25,7 +26,13 @@ SECRET_KEY = 'django-insecure-poc3a7umk0!9w9x^6+r3j*rhc895*tv(4_w2y0l=h-y09r$29k
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.environ.get(
+        'DJANGO_ALLOWED_HOSTS', '127.0.0.1,localhost'
+    ).split(',')
+    if host.strip()
+]
 
 
 # Application definition
@@ -37,6 +44,8 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'rest_framework',
+    'yard',
 ]
 
 MIDDLEWARE = [
@@ -123,4 +132,6 @@ STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 MOVEMENT_GAP_SECONDS = 20
+CLOSURE_SWEEP_SECONDS = 5
+PLAN_MATCH_WINDOW_MINUTES = 60
 VALIDATION_POLICY = 'RFID_PRIMARY_COUNTS_V4'
