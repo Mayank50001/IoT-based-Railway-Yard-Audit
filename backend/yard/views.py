@@ -14,6 +14,7 @@ from django.conf import settings
 from django.utils import timezone
 from rest_framework.exceptions import ParseError
 from rest_framework.parsers import JSONParser
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -120,8 +121,12 @@ def _ingest_one(device, raw, received_at):
 
 
 class IngestEventsView(APIView):
+    # Firmware has its own credentials. Explicitly opt out of the dashboard's
+    # session authentication and global IsAuthenticated default: a browser
+    # session must never be able to submit events, and a device key must never
+    # be accepted as a human identity.
     authentication_classes = ()
-    permission_classes = ()
+    permission_classes = (AllowAny,)
     parser_classes = (JSONParser,)
 
     def post(self, request):

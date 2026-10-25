@@ -142,5 +142,23 @@ DEVICE_AUTH_CACHE_SECONDS = 60
 INGEST_MAX_BATCH_SIZE = 50
 
 REST_FRAMEWORK = {
+    # Humans are session-authenticated; firmware is authenticated separately in
+    # the ingestion view, which opts out of both of these defaults.
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'yard.access.YardSessionAuthentication',
+    ),
+    # Fail closed: a new view is protected unless it explicitly opts out.
+    'DEFAULT_PERMISSION_CLASSES': (
+        'rest_framework.permissions.IsAuthenticated',
+    ),
     'EXCEPTION_HANDLER': 'yard.api.exception_handler',
 }
+
+# A station-bound account, not a long-lived personal login: one yard shift.
+SESSION_COOKIE_AGE = 12 * 60 * 60
+SESSION_COOKIE_SAMESITE = 'Lax'
+CSRF_COOKIE_SAMESITE = 'Lax'
+
+# Login is the only unauthenticated write. Per client IP, because one NAT
+# serves the yard; see yard/throttles.py for the trade-off.
+LOGIN_THROTTLE_RATE = '10/min'

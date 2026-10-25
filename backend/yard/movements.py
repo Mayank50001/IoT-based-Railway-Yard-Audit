@@ -122,8 +122,13 @@ def close_movement(movement, closed_at=None):
     return True
 
 
-def close_idle_movements(now=None):
-    """Close every movement whose last evidence is older than the gap."""
+def close_idle_movements(now=None, station=None):
+    """Close every movement whose last evidence is older than the gap.
+
+    ``station`` restricts the sweep to one station. A dashboard read passes the
+    session's station so one station's page load cannot close another station's
+    bucket; the scheduled sweep passes nothing and covers everything.
+    """
     now = now or clock.server_now()
     cutoff = now - timedelta(seconds=gap_seconds())
 
@@ -131,6 +136,8 @@ def close_idle_movements(now=None):
         state=Movement.State.OPEN,
         last_evidence_at__lt=cutoff,
     ).select_related('device')
+    if station is not None:
+        candidates = candidates.filter(station=station)
 
     closed = 0
     with transaction.atomic():

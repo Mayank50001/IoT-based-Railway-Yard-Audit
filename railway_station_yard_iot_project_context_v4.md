@@ -44,7 +44,7 @@ One station may have one shared gate or several separate gates. A `device` recor
 ### Lane mode
 
 1. Each lane has a current `lane_mode` of `ENTRY`, `EXIT`, or unset.
-2. An authenticated operator sets the mode before passing stock. Every change is appended to `lane_mode_changes` with `set_by`, `changed_at`, and an optional note. History is never edited.
+2. An authenticated operator sets the mode before passing stock. Every change is appended to `lane_mode_changes` with `set_by`, `changed_at`, and an optional note. History is never edited. Through the dashboard, only `YARD_MASTER` and `ADMIN` may change it; `VIEWER` is read-only. Repeating the current mode is a no-op and writes no audit row. A disabled lane cannot be changed.
 3. Ingestion **rejects** events for a lane whose mode is unset (HTTP 409, `LANE_MODE_NOT_SET`). It does not guess, default, or create a movement without a direction. The firmware queue retains the events and retries.
 4. The mode applies to the **next** movement opened on that lane. An already-open movement keeps the direction it was opened with, even if the operator changes the mode mid-consist.
 5. The movement stores its `direction`, a `direction_source` (`OPERATOR` now; `PLAN` and `INFERRED` are reserved), and the exact `lane_mode_change` row that authorised it. The audit trail therefore answers "who said this was an entry?"
@@ -63,6 +63,50 @@ There is at most one `OPEN` movement per device. Direction is part of the moveme
 Device sensing timestamps and passage entry/exit metadata remain useful audit data. Passage timestamps continue to describe detection-zone entry, even though the event is emitted on exit. They are **not used for per-unit pairing** in v4.
 
 Store timestamps in UTC and display IST on the dashboard. Do not label an unsynchronised clock as UTC. Delayed queue replay can still distort receive-time movement segmentation; this inherited prototype limitation is not solved by changing the counting policy.
+
+### Authentication and station scoping
+
+Dashboard access uses a Django **session cookie with CSRF protection**, not a per-user API token. A token in browser storage is a second copy of the credential with no operational advantage here, and a session can be revoked by deactivating the account. Device API keys and human sessions are separate credentials; neither authenticates the other surface.
+
+Every account is bound to exactly one station through `StaffProfile`. There is **no cross-station administrator**: `ADMIN` means full rights *at that station*. A dashboard request for another station's object returns 404, identical to a missing object, so one station cannot confirm that another station's lane exists.
+
+| Role | Read lanes and yard state | Change lane mode and other yard state |
+|---|---|---|
+| `VIEWER` | yes | no |
+| `YARD_MASTER` | yes | yes |
+| `ADMIN` | yes | yes, at the same station |
+
+The Django admin site is a separate superuser operations console and is **not** station-scoped. The `create_staff` command deliberately creates a dashboard account without Django admin access; an account that needs both must be granted admin access separately and knowingly. This keeps the "no cross-station administrator" rule true for the dashboard rather than pretending a role name also secures the admin site.
+
+Login is rate-limited per client IP (initially 10 attempts per minute), because login is the only unauthenticated write. A successful login creates a fresh session key and the session expires after a yard shift (12 hours by default).
+
+The lane API used by the dashboard:
+
+```text
+GET  /api/auth/csrf           -> CSRF cookie and token for the next unsafe request
+POST /api/auth/login          -> start a session; returns user, station, role
+POST /api/auth/logout         -> end the session
+GET  /api/auth/me             -> current user, station, role
+GET  /api/lanes               -> lanes at the account's station
+GET  /api/lanes/<device_id>   -> one lane, recent mode changes, current open movement
+POST /api/lanes/<device_id>/mode  -> {"direction": "ENTRY"|"EXIT", "note": "..."}
+```
+
+A successful mode change returns `applies_to: "NEXT_MOVEMENT"` and the still-open movement, if any. That distinction is deliberate: the operator changed the lane, but the consist already being watched did not change direction.
+
+The station-scoped read API used by the dashboard:
+
+```text
+GET  /api/overview                       -> lanes, inventory totals, open movements, open alerts
+GET  /api/movements                      -> filters: state, direction, result, device_id; limit/offset
+GET  /api/movements/<id>                 -> movement, findings, alerts, events, inventory effects, observed counts
+GET  /api/findings                       -> filters: severity, code, movement
+GET  /api/alerts                         -> filters: severity, code, acknowledged
+POST /api/alerts/<id>/acknowledge        -> record the operator and time; repeating is a no-op
+GET  /api/inventory                      -> filters: status, verification, q (UID fragment)
+```
+
+Movement reads close idle buckets first, so a dashboard without a scheduler never shows a movement that should already have closed. This means some GETs perform a write; that is an accepted prototype trade-off. Read responses never recompute business rules that a stored finding already carries.
 
 ### Device event contract
 
@@ -313,6 +357,7 @@ Changes for v4:
 - Model the gate as a lane: `device.lane_mode` holds the operator-selected direction, and `lane_mode_changes` is an append-only audit of who changed it, when, and why.
 - Record `direction`, `direction_source`, and the authorising `lane_mode_change` on every movement.
 - Enforce one open movement **per device**, one movement per bound plan, station-scoped inventory uniqueness, event-id uniqueness, and alert deduplication.
+- Record one frozen pre-movement inventory effect per distinct read UID, so a revalidation evaluates anomalies against the state before the movement and never replays or rewinds a transition.
 - Do not enforce a fixed entry/exit classification on devices, and do not add an editable `entered`/`exited` pair to rolling stock.
 
 The event contract remains `RFID_DETECTED` / `PHYSICAL_PASSAGE`, with `event_id`, `device_id`, `sequence`, device timestamp, UID where applicable, and passage metadata. No firmware change is needed merely to make the backend count distinct UIDs instead of pairing events.
@@ -347,6 +392,15 @@ Unless otherwise stated, use a plan expecting **1 lead locomotive + 4 coaches**.
 | One malformed event inside a batch | That event is `rejected` with a code; the rest are accepted; the queue is not blocked |
 | Same `event_id` sent by a different device | HTTP 409 `EVENT_ID_DEVICE_MISMATCH`; nothing is stored |
 | Same physical lane used for an entry and later an exit | One device record; two movements with different directions; both auditable to their `lane_mode_change` |
+| Dashboard request without a session | HTTP 401 `NOT_AUTHENTICATED`; no yard data |
+| Session for an account with no `StaffProfile` | HTTP 403 `NO_STAFF_PROFILE`; no session is created at login |
+| Session for an inactive profile or inactive station | HTTP 403 `STAFF_INACTIVE` / `STATION_INACTIVE` |
+| Account requests another station's lane | HTTP 404, byte-identical to a nonexistent lane; no confirmation of its existence |
+| `VIEWER` attempts a lane-mode change | HTTP 403 `ROLE_NOT_PERMITTED`; lane unchanged |
+| Operator repeats the current lane mode | HTTP 200 `changed: false`; no new audit row |
+| Operator changes the mode on a disabled lane | HTTP 409 `LANE_INACTIVE`; lane unchanged |
+| Device key sent to a dashboard endpoint | HTTP 401; device credentials do not authenticate a human |
+| Dashboard session sent to ingestion without device keys | HTTP 401 `DEVICE_AUTH_REQUIRED`; a session does not authenticate a device |
 
 Also test UID normalization, spoofed station/direction fields, disabled devices, exact 20-second boundaries, closure without future events, alert deduplication, and revalidation without repeated inventory transitions.
 
@@ -376,7 +430,9 @@ Backend defaults:
 - `plan_match_window_minutes = 60`;
 - `validation_policy = RFID_PRIMARY_COUNTS_V4`;
 - `device_auth_cache_seconds = 60`;
-- `ingest_max_batch_size = 50`.
+- `ingest_max_batch_size = 50`;
+- `login_throttle_rate = 10/min` per client IP;
+- `session_cookie_age = 12 hours` (one yard shift).
 
 Firmware retains configurable ultrasonic filtering, threshold/hysteresis, minimum occupied/clear intervals, RFID cooldown, and bounded queue/retry settings. A starting same-UID absence/cooldown is 3 seconds; refresh its last-seen time on every successful raw read.
 

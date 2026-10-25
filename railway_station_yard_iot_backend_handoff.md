@@ -1,9 +1,9 @@
 # Railway Yard IoT — Hardware Progress and Backend Session Handoff
 
 **Updated:** 2026-10-25  
-**Next task:** Build CP-07 in two steps. First authentication: Django-session login/logout/me for yard masters, a global `IsAuthenticated` default, station scoping from `StaffProfile`, role checks, and `set_by` recorded on every lane-mode change. Then RFID-primary inventory transitions (once per distinct UID actually read) and the station-scoped read APIs, including the operator lane-mode control. Ingestion, movement buckets, and validation are implemented and tested. Progress is tracked in the [Backend Implementation Log](railway_station_yard_iot_backend_implementation_log.md).
+**Next task:** CP-08 — a simulator that drives the v4 acceptance scenarios through the **real ingestion endpoint** (single and batch, retries, multi-locomotive and unexpected-exit cases), then the Django-served dashboard over the read APIs. CP-07a (session authentication, station scoping, roles, lane mode) and CP-07b (frozen inventory transitions, station-scoped read APIs) are **VERIFIED**. Progress is tracked in the [Backend Implementation Log](railway_station_yard_iot_backend_implementation_log.md).
 
-> Read this handoff first, then [RFID-Primary Specification — v4](railway_station_yard_iot_project_context_v4.md). Use v3 only for compatible background details, not its superseded mandatory-pairing/paired-inventory rules. Progress, decisions, and verification steps are recorded in the [Backend Implementation Log](railway_station_yard_iot_backend_implementation_log.md) — check it before starting work. This handoff records reported hardware results and the latest implementation direction; it is not a claim that the assistant independently ran the hardware tests or implemented the backend.
+> Read this handoff first, then [RFID-Primary Specification — v4](railway_station_yard_iot_project_context_v4.md). Use v3 only for compatible background details, not its superseded mandatory-pairing/paired-inventory rules. Progress, decisions, and verification steps are recorded in the [Backend Implementation Log](railway_station_yard_iot_backend_implementation_log.md) — check it before starting work. This handoff records reported hardware results and the latest implementation direction; it is not a claim that the reported hardware results were independently measured by the assistant.
 
 ## 1. Current outcome and user preferences
 
@@ -14,7 +14,7 @@
 - The immediate goal is to continue the **backend**, not to generate ESP32 firmware yet.
 - After the backend/event contract is ready, the user expects complete MicroPython **`main.py` code for the ESP32**, including any necessary driver dependency rather than unexplained imports.
 - The user approved moving forward with **distinct RFID UID counts as primary validation**, ultrasonic counts as supporting evidence, and coach-based lookup of expected locomotive/plan information when the locomotive RFID is absent.
-- Follow `AGENTS.md`: provide code in chat unless code-file edits are explicitly authorized, and ask before accessing files outside the project. This revision changes documentation only.
+- Follow `AGENTS.md`: provide code in chat unless code-file edits are explicitly authorized, and ask before accessing files outside the project. Code-file edits were authorized for the backend work; the implementation log records what was delivered and verified.
 
 ## 2. Hardware and environment reported by the user
 
@@ -234,9 +234,52 @@ Use a modular monolith. Do not introduce microservices, railway control, long-ra
 
 ### Current repository state
 
-The project contains the v2/v3/v4 specifications, this handoff, `AGENTS.md`, the existing `env/`, and the Django project at `backend/`. The `yard` app now contains the domain models, admin, lane-mode audit, demo seed command, device-authenticated ingestion, movement buckets, RFID-primary validation, and 84 tests; migrations `0001` and `0002` are applied. Inventory transitions, authentication, and dashboard/read APIs are **not** implemented yet. See the implementation log for the verified state and the CP-04/CP-06 file inventories.
+The project contains the v2/v3/v4 specifications, this handoff, `AGENTS.md`, the existing `env/`, and the Django project at `backend/`. The `yard` app now contains the domain models, admin, lane-mode audit, demo seed command, device-authenticated ingestion, movement buckets, RFID-primary validation, frozen inventory transitions, yard-master session authentication with station-scoped lane control, and station-scoped read APIs; migrations `0001`, `0002`, and `0003` are applied. The suite is **154 tests** (151 in `yard` plus 3 health tests) and passes. Dashboard templates and the simulator are **not** implemented yet. See the implementation log for the verified state and the CP-04/CP-06/CP-07a/CP-07b file inventories.
 
 Investigate the existing environment before using or replacing it. Preserve unfamiliar files and any user work. The current hardware scripts live outside the supplied repository context; do not claim to have inspected them.
+
+### Dashboard accounts (added in CP-07a)
+
+Authentication is a Django **session cookie plus CSRF**, not a per-user API token. Every account is bound to exactly one station through `StaffProfile`; `ADMIN` is station-scoped and there is no cross-station administrator. A dashboard request for another station's object returns 404, identical to a missing object.
+
+Create a demo account with:
+
+```bash
+cd backend
+python manage.py create_staff --username yard1 --station NDLS --role YARD_MASTER
+```
+
+`create_staff` creates a *dashboard* account and deliberately does **not** grant Django admin access. The admin site is a separate superuser console and is not station-scoped (D-43). The command requires `--password` when `--noinput` is used with a new account; an existing user can be updated without resetting the password.
+
+Session surface:
+
+```text
+GET  /api/auth/csrf                 -> CSRF token and cookie
+POST /api/auth/login                -> {"username", "password"} -> identity
+POST /api/auth/logout               -> 204
+GET  /api/auth/me                   -> identity
+GET  /api/lanes                     -> lanes at the account's station
+GET  /api/lanes/<device_id>         -> lane, open movement, recent mode changes
+POST /api/lanes/<device_id>/mode    -> {"direction": "ENTRY"|"EXIT", "note": "..."}
+```
+
+A mode change while a movement is open is accepted: the open movement keeps its direction and its authorising `lane_mode_change`, and the new mode applies to the next movement (`applies_to: "NEXT_MOVEMENT"`). Device credentials and dashboard sessions are mutually exclusive; neither authenticates the other surface.
+
+### Inventory and read APIs (added in CP-07b)
+
+At movement closure the backend records a `MovementInventoryEffect` for every distinct UID actually read, freezing `status_before` **before** applying the transition. Revalidation judges anomalies against that snapshot, never replays a transition, and never overwrites a later movement's state. Known UIDs in a `VALID` movement become `VERIFIED`; known UIDs in `FLAGGED`/`UNVERIFIED` movements and unknown UIDs are `UNVERIFIED`. A planned locomotive that was never read receives no inventory transition.
+
+```text
+GET  /api/overview                     -> lanes, inventory totals, open movements, open alerts
+GET  /api/movements                    -> state, direction, result, device_id, limit, offset
+GET  /api/movements/<id>               -> movement, findings, alerts, events, inventory effects, observed counts
+GET  /api/findings                     -> severity, code, movement
+GET  /api/alerts                       -> severity, code, acknowledged
+POST /api/alerts/<id>/acknowledge      -> idempotent; records acknowledged_by
+GET  /api/inventory                    -> status, verification, q
+```
+
+Movement, inventory, and overview reads close idle buckets first (D-49), so the dashboard is correct even without a running sweep scheduler. All reads are station-scoped; another station's row is a 404.
 
 ## 9. Recommended backend continuation order
 
@@ -247,12 +290,12 @@ Use v4 for the current policy, model changes, scenarios, and implementation orde
 3. **Ingestion (M2) — done in CP-04:** `POST /api/ingest/events`, `X-Device-ID` + `X-Api-Key`, single-event/small-batch support (50 max), UID normalization, per-event validation results, transactional storage, and idempotent duplicate handling. Duplicate events return HTTP 200 with the original movement and are not assigned or counted again.
 4. **Movement construction (M3) — done in CP-04:** one OPEN movement per device, gap <= 20 seconds remains the same movement, gap > 20 seconds starts another, idempotent `sweep_movements` command. Direction is captured from the lane mode at bucket open. Closing currently marks the movement and adds an INFO `VALIDATION_PENDING` finding; validation fills the result in M4.
 5. **RFID-primary validation (M4) — done in CP-06:** direct/fallback plan lookup, distinct known composition by type, aggregate ultrasonic warning, stored findings and alerts, and idempotent revalidation. A movement is validated inside its closure transaction and the outcome (`VALID` / `FLAGGED` / `UNVERIFIED`) is visible immediately. No per-unit pairing anywhere. `python manage.py revalidate_movements` backfills anything closed before validation existed.
-6. **Inventory and authentication (M5/M6) — next:** one inventory transition per distinct UID actually read, Django-session yard-master login with station scoping, and the read APIs.
-7. **Simulator (M7):** acceptance scenarios through the same ingestion endpoint.
-6. **Inventory and APIs (M5):** update distinct actually read UIDs at closure without requiring ultrasonic pairs, retain unknown UIDs as unverified, handle unexpected exits, and scope dashboard/admin access appropriately. Missing/inferred locomotive UIDs must not generate observations or new inventory transitions.
-7. **Simulator/dashboard (M6 and supporting work):** use the same ingestion endpoint and event schema for the v4 acceptance scenarios. Adapt older scenarios to the revised warning/inventory policy. The backend must be fully demonstrable without physical hardware.
-8. **Final ESP32 firmware (M7):** provide the requested complete `main.py` against the stable API contract; confirm GPIOs/electrical details and preserve existing boot files before deployment.
-9. **Integrated rehearsal (M8):** rerun sensing acceptance with actual firmware, HTTP ingestion, retry/reconnection, and the separated-sensor card workflow.
+6. **Authentication and lane control (M5a) — done in CP-07a:** Django-session login/logout/me, a fail-closed global `IsAuthenticated` default, station scoping from `StaffProfile`, role checks (`VIEWER` read-only), audited `set_by` on every lane-mode change, and `create_staff` for station-bound demo accounts. Device keys and sessions are mutually exclusive.
+7. **Inventory and read APIs (M5b) — done in CP-07b:** one inventory transition per distinct UID actually read, applied at closure against a frozen pre-movement snapshot, so revalidation never repeats or rewinds a transition. Unknown UIDs are retained as unverified, unexpected exits are unverified `OUT` rows, and station-scoped movement, finding, alert, and inventory read endpoints are live. A planned locomotive that was not read receives no transition.
+8. **Simulator (M6) — next:** acceptance scenarios through the same ingestion endpoint and event schema, including retries, duplicate UIDs, ultrasonic disagreement, unknown tags, unexpected exits, and a multi-locomotive plan that no demo seed currently covers. The backend must be fully demonstrable without physical hardware.
+9. **Dashboard:** Django-served templates over the read APIs, with the lane-mode control and the operator identity from the session.
+10. **Final ESP32 firmware (M7):** provide the requested complete `main.py` against the stable API contract; confirm GPIOs/electrical details and preserve existing boot files before deployment.
+11. **Integrated rehearsal (M8):** rerun sensing acceptance with actual firmware, HTTP ingestion, retry/reconnection, and the separated-sensor card workflow.
 
 ### Important backend test coverage
 
@@ -266,6 +309,8 @@ Use v4 for the current policy, model changes, scenarios, and implementation orde
 - Coach-based fallback binds only an unambiguous eligible plan, flags the absent locomotive RFID, and does not conceal a conflicting observed locomotive.
 - Unknown tags, passages-only evidence, RFID-only evidence, wrong/unplanned composition, unexpected exits, and repeated validation follow v4.
 - Actually read UIDs update inventory without pairing. Retries, repeated UIDs, and revalidation never repeat transitions or overwrite a later movement's state.
+- A dashboard session cannot authenticate ingestion, and a device key cannot authenticate a dashboard request.
+- Another station's lane is a 404 byte-identical to a missing lane; a `VIEWER` is refused a lane-mode change with `403 ROLE_NOT_PERMITTED`; every accepted change records the authenticated `set_by`.
 
 ### Clarifications to retain while implementing
 
@@ -292,4 +337,4 @@ Do not force card detections into pairs in firmware. Preserve the actual indepen
 
 ## 11. Suggested prompt for the next session
 
-> Read `AGENTS.md`, `railway_station_yard_iot_backend_handoff.md`, `railway_station_yard_iot_project_context_v4.md`, and `railway_station_yard_iot_backend_implementation_log.md`. My ESP32/RC522/ultrasonic bench tests are reported passing with separated sensors. Continue the existing Django project using RFID-primary distinct UID/type counts, aggregate ultrasonic warnings, coach-based plan lookup, and RFID-primary inventory. Devices are physical lanes with an audited operator-selected `lane_mode`; do not infer direction from inventory state. Do not implement per-unit pairing or fabricate a missed locomotive read. Ingestion (`POST /api/ingest/events`, contract `<device_id>-<boot_id>-<sequence>`), movement buckets, and RFID-primary validation are implemented and tested. Next: CP-07 — Django-session yard-master authentication with station scoping from `StaffProfile` and an audited `set_by` on lane-mode changes, then RFID-primary inventory transitions and the station-scoped read APIs, then the simulator. Do not generate ESP32 firmware yet.
+> Read `AGENTS.md`, `railway_station_yard_iot_backend_handoff.md`, `railway_station_yard_iot_project_context_v4.md`, and `railway_station_yard_iot_backend_implementation_log.md`. My ESP32/RC522/ultrasonic bench tests are reported passing with separated sensors. Continue the existing Django project using RFID-primary distinct UID/type counts, aggregate ultrasonic warnings, coach-based plan lookup, and RFID-primary inventory. Devices are physical lanes with an audited operator-selected `lane_mode`; do not infer direction from inventory state. Do not implement per-unit pairing or fabricate a missed locomotive read. Ingestion (`POST /api/ingest/events`, contract `<device_id>-<boot_id>-<sequence>`), movement buckets, RFID-primary validation, CP-07a session authentication with station-scoped lane control, and CP-07b inventory/read APIs are implemented and tested (154 tests). Next: CP-08 — a simulator that drives the v4 acceptance scenarios through the real ingestion endpoint, including retries, duplicate UIDs, unknown tags, unexpected exits, and a multi-locomotive plan; then the Django-served dashboard. Do not generate ESP32 firmware yet.

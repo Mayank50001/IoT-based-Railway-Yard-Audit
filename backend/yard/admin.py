@@ -9,6 +9,7 @@ from .models import (
     Movement,
     MovementEvent,
     MovementFinding,
+    MovementInventoryEffect,
     MovementPlan,
     PlanAssignment,
     RollingStock,
@@ -164,6 +165,21 @@ class MovementFindingInline(admin.TabularInline):
         return False
 
 
+class MovementInventoryEffectInline(admin.TabularInline):
+    """The frozen pre-movement snapshot and the one transition it authorised."""
+
+    model = MovementInventoryEffect
+    extra = 0
+    fields = ('rfid_uid', 'status_before', 'status_after', 'applied_at')
+    readonly_fields = fields
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
 @admin.register(Movement)
 class MovementAdmin(admin.ModelAdmin):
     list_display = (
@@ -192,7 +208,11 @@ class MovementAdmin(admin.ModelAdmin):
         'expected_wagons',
         'expected_lead_loco',
     )
-    inlines = (MovementEventInline, MovementFindingInline)
+    inlines = (
+        MovementEventInline,
+        MovementFindingInline,
+        MovementInventoryEffectInline,
+    )
 
 
 @admin.register(InventoryRecord)

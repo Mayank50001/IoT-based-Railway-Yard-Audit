@@ -10,11 +10,11 @@ are pruned: revalidation corrects the current picture without losing when a
 finding was first seen. Alerts are created once and never deleted, because an
 acknowledgement is part of the audit trail.
 
-Inventory transitions are **not** applied here; that is CP-07. Until then the
-current inventory row *is* the pre-movement state, which is what the
-``UNEXPECTED_EXIT``, ``ENTRY_ALREADY_PRESENT`` and ``DIRECTION_CONFLICT`` checks
-read. CP-07 must freeze the pre-movement state before applying transitions, or
-revalidation will read its own earlier update.
+Inventory is applied through ``MovementInventoryEffect`` rows. The first
+validation freezes the pre-movement state for every distinct read UID, applies
+one transition per UID, and marks the effect applied. Revalidation reads that
+same frozen state, so it cannot mistake its own earlier write (or a later
+movement's) for the state before this movement.
 """
 
 from datetime import timedelta
@@ -31,10 +31,12 @@ from .models import (
     Movement,
     MovementEvent,
     MovementFinding,
+    MovementInventoryEffect,
     MovementPlan,
     PlanAssignment,
     RollingStock,
 )
+from .uid import canonical_uid
 
 # Legacy marker: movements closed before validation existed carry this finding.
 VALIDATION_PENDING = 'VALIDATION_PENDING'
@@ -59,9 +61,18 @@ WARN = MovementFinding.Severity.WARN
 
 
 class Composition:
-    """Distinct-identity view of one movement's stored events."""
+    """Distinct-identity view of one movement's stored events.
 
-    def __init__(self, events):
+    The observed UID is the evidence; the identity is resolved against the
+    *current* rolling-stock registry, falling back to the snapshot stored on the
+    event. Registering a previously unknown UID and revalidating therefore
+    corrects the earlier classification instead of leaving the movement
+    permanently mislabelled. ``RollingStock.rfid_uid`` is unique, so the lookup
+    is unambiguous.
+    """
+
+    def __init__(self, events, registry=None):
+        registry = registry or {}
         self.rfid_observation_count = 0
         self.passage_count = 0
         # Insertion-ordered so findings follow the order units were read.
@@ -74,11 +85,13 @@ class Composition:
                 continue
 
             self.rfid_observation_count += 1
-            uid = event.rfid_uid
+            uid = canonical_uid(event.rfid_uid)
             self.observation_counts[uid] = (
                 self.observation_counts.get(uid, 0) + 1
             )
-            self.stock_by_uid.setdefault(uid, event.rolling_stock)
+            self.stock_by_uid.setdefault(
+                uid, registry.get(uid, event.rolling_stock)
+            )
 
     @property
     def distinct_uids(self):
@@ -122,6 +135,29 @@ class Composition:
             for uid in self.known_uids
             if not self.stock_by_uid[uid].is_active
         ]
+
+
+def composition_for(movement):
+    """Build the current distinct-identity view of a movement's events.
+
+    Shared by validation and the read API so the dashboard counts identities the
+    same way the policy does instead of re-deriving them from the stored
+    ``rolling_stock`` snapshot.
+    """
+    events = list(
+        movement.events.select_related('rolling_stock').order_by(
+            'received_at', 'id'
+        )
+    )
+    registry = {
+        stock.rfid_uid: stock
+        for stock in RollingStock.objects.filter(
+            rfid_uid__in={
+                event.rfid_uid for event in events if event.rfid_uid
+            }
+        )
+    }
+    return Composition(events, registry)
 
 
 def _finding(code, severity, subject, message, **details):
@@ -287,18 +323,158 @@ def resolve_plan(movement, composition):
     return result
 
 
-# --- Findings ----------------------------------------------------------------
+# --- Inventory ---------------------------------------------------------------
 
-def _inventory_states(movement, uids):
-    return dict(
-        InventoryRecord.objects.filter(
-            station_id=movement.station_id,
-            rfid_uid__in=uids,
-        ).values_list('rfid_uid', 'status')
+def freeze_inventory(movement, composition):
+    """Return this movement's immutable pre-movement inventory snapshot.
+
+    One effect row per distinct read UID, keyed by UID. Rows are created at the
+    first validation and reused afterwards; the current inventory is read only
+    for UIDs that have no row yet. Re-reading it for an existing row would
+    return this movement's own transition and make a repeated entry look like a
+    fresh one.
+
+    The unique ``(movement, rfid_uid)`` constraint is the arbiter if two
+    validations race: the loser re-reads rather than duplicating.
+    """
+    uids = composition.distinct_uids
+    status_after = (
+        InventoryRecord.Status.IN_YARD
+        if movement.direction == Direction.ENTRY
+        else InventoryRecord.Status.OUT
     )
 
+    effects = _effects_for(movement, uids)
+    missing = [uid for uid in uids if uid not in effects]
+    if missing:
+        current = dict(
+            InventoryRecord.objects.filter(
+                station_id=movement.station_id,
+                rfid_uid__in=missing,
+            ).values_list('rfid_uid', 'status')
+        )
+        MovementInventoryEffect.objects.bulk_create(
+            [
+                MovementInventoryEffect(
+                    movement=movement,
+                    rfid_uid=canonical_uid(uid),
+                    status_before=current.get(uid),
+                    status_after=status_after,
+                )
+                for uid in missing
+            ],
+            ignore_conflicts=True,
+        )
+        effects = _effects_for(movement, uids)
 
-def build_findings(movement, composition, resolution):
+    return effects
+
+
+def _effects_for(movement, uids):
+    return {
+        effect.rfid_uid: effect
+        for effect in MovementInventoryEffect.objects.filter(
+            movement=movement,
+            rfid_uid__in=uids,
+        )
+    }
+
+
+def _verification_for(stock, outcome):
+    """``VERIFIED`` means RFID-validated, not independently proven present."""
+    if stock is not None and outcome == Movement.Outcome.VALID:
+        return InventoryRecord.Verification.VERIFIED
+    return InventoryRecord.Verification.UNVERIFIED
+
+
+def apply_inventory(movement, composition, effects, outcome):
+    """Write one inventory transition per distinct read UID, exactly once.
+
+    Presence changes only when the target status differs from the frozen state:
+    an entry of stock already inside keeps its original ``since`` and the
+    movement that established it. ``last_movement`` therefore always names the
+    movement that produced the current status, which is what makes a later
+    revalidation safe to skip when another movement has since taken ownership.
+    """
+    now = clock.server_now()
+
+    for uid in composition.distinct_uids:
+        effect = effects[uid]
+        if effect.applied_at is not None:
+            continue
+
+        stock = composition.stock_by_uid[uid]
+        target = effect.status_after
+        record = InventoryRecord.objects.filter(
+            station_id=movement.station_id,
+            rfid_uid=uid,
+        ).first()
+
+        if record is None:
+            InventoryRecord.objects.create(
+                station=movement.station,
+                rfid_uid=uid,
+                rolling_stock=stock,
+                status=target,
+                verification=_verification_for(stock, outcome),
+                since=now,
+                last_movement=movement,
+            )
+        elif record.status != target:
+            record.status = target
+            record.verification = _verification_for(stock, outcome)
+            record.rolling_stock = stock or record.rolling_stock
+            record.since = now
+            record.last_movement = movement
+            record.save(
+                update_fields=(
+                    'status',
+                    'verification',
+                    'rolling_stock',
+                    'since',
+                    'last_movement',
+                    'updated_at',
+                )
+            )
+        # else: presence unchanged. Do not touch ``since``, ``last_movement`` or
+        # ``verification``; this movement did not establish the current state.
+
+        effect.applied_at = now
+        effect.save(update_fields=('applied_at', 'updated_at'))
+
+
+def reconcile_inventory(movement, composition, effects, outcome):
+    """Refresh rows this movement still owns after an outcome change.
+
+    A revalidation cannot change the transition itself, but it can change
+    ``VALID`` to ``FLAGGED`` (or back after corrected master data). Only rows
+    whose ``last_movement`` is still this movement are touched; anything a
+    later movement has claimed is left alone.
+    """
+    owned = InventoryRecord.objects.filter(
+        station_id=movement.station_id,
+        last_movement=movement,
+        rfid_uid__in=composition.distinct_uids,
+    )
+
+    for record in owned:
+        effect = effects[record.rfid_uid]
+        if record.status != effect.status_after:
+            continue
+
+        stock = composition.stock_by_uid.get(record.rfid_uid)
+        update = {}
+        verification = _verification_for(stock, outcome)
+        if record.verification != verification:
+            update['verification'] = verification
+        if stock is not None and record.rolling_stock_id != stock.pk:
+            update['rolling_stock'] = stock
+        if update:
+            update['updated_at'] = clock.server_now()
+            InventoryRecord.objects.filter(pk=record.pk).update(**update)
+
+
+def build_findings(movement, composition, resolution, effects):
     plan = resolution['plan']
     findings = []
 
@@ -444,13 +620,11 @@ def build_findings(movement, composition, resolution):
 
     known = composition.known_uids
     if known:
-        states = _inventory_states(movement, known)
-
         if movement.direction == Direction.ENTRY:
             already_present = [
                 uid
                 for uid in known
-                if states.get(uid) == InventoryRecord.Status.IN_YARD
+                if effects[uid].status_before == InventoryRecord.Status.IN_YARD
             ]
             for uid in already_present:
                 findings.append(
@@ -479,7 +653,7 @@ def build_findings(movement, composition, resolution):
                 )
         else:
             for uid in known:
-                if states.get(uid) != InventoryRecord.Status.IN_YARD:
+                if effects[uid].status_before != InventoryRecord.Status.IN_YARD:
                     findings.append(
                         _finding(
                             UNEXPECTED_EXIT,
@@ -623,14 +797,10 @@ def validate_movement(movement):
     if movement.state != Movement.State.CLOSED:
         raise ValueError('Only a closed movement can be validated.')
 
-    events = list(
-        movement.events.select_related('rolling_stock').order_by(
-            'received_at', 'id'
-        )
-    )
-    composition = Composition(events)
+    composition = composition_for(movement)
+    effects = freeze_inventory(movement, composition)
     resolution = resolve_plan(movement, composition)
-    findings = build_findings(movement, composition, resolution)
+    findings = build_findings(movement, composition, resolution, effects)
 
     _bind_plan(movement, resolution)
 
@@ -656,6 +826,10 @@ def validate_movement(movement):
         )
     )
 
+    apply_inventory(movement, composition, effects, movement.validation_result)
+    reconcile_inventory(
+        movement, composition, effects, movement.validation_result
+    )
     _store_findings(movement, findings)
     _store_alerts(movement, findings)
 

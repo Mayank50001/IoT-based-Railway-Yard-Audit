@@ -634,3 +634,64 @@ class InventoryRecord(TimeStampedModel):
 
     def __str__(self):
         return f'{self.rfid_uid} @ {self.station.code} ({self.status})'
+
+
+class MovementInventoryEffect(TimeStampedModel):
+    """The frozen inventory state for one distinct UID in one movement.
+
+    This row is created during validation *before* any inventory transition is
+    written, so ``status_before`` is what the yard looked like before this
+    movement. Every anomaly finding (``ENTRY_ALREADY_PRESENT``,
+    ``UNEXPECTED_EXIT``, ``DIRECTION_CONFLICT``) is evaluated against this
+    snapshot on every revalidation. Reading the live inventory row instead would
+    mistake this movement's own update, or a later movement's, for the prior
+    state.
+
+    ``applied_at`` is the "transition already written" marker. A revalidation
+    recomputes findings from the snapshot but never replays the transition, so a
+    later movement's state can never be overwritten. ``status_before`` is null
+    when no inventory row existed at all.
+    """
+
+    movement = models.ForeignKey(
+        Movement,
+        on_delete=models.CASCADE,
+        related_name='inventory_effects',
+    )
+    rfid_uid = models.CharField(max_length=32)
+    status_before = models.CharField(
+        max_length=8,
+        choices=InventoryRecord.Status.choices,
+        null=True,
+        blank=True,
+        help_text='Inventory status before this movement; null when no row existed.',
+    )
+    status_after = models.CharField(
+        max_length=8,
+        choices=InventoryRecord.Status.choices,
+    )
+    applied_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text='Set once the transition has been applied; never cleared.',
+    )
+
+    class Meta:
+        ordering = ('movement', 'id')
+        constraints = [
+            models.UniqueConstraint(
+                fields=('movement', 'rfid_uid'),
+                name='unique_inventory_effect_per_movement_uid',
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.rfid_uid:
+            self.rfid_uid = canonical_uid(self.rfid_uid)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return (
+            f'{self.rfid_uid} {self.status_before or "ABSENT"} -> '
+            f'{self.status_after} (movement {self.movement_id})'
+        )

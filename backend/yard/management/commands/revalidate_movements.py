@@ -4,8 +4,13 @@ CP-04 closed movements without an outcome and left an INFO ``VALIDATION_PENDING`
 finding. Running this command once after deploying CP-06 replaces those
 placeholders with real findings and outcomes.
 
-It is also the tool for a deliberate revalidation: findings are replaced and
-alerts are not duplicated, so running it again is safe.
+It is also the tool for a deliberate revalidation: findings are replaced, alerts
+are not duplicated, and inventory transitions are never replayed, so running it
+again is safe.
+
+``--all`` also applies inventory for a movement validated before the effect
+ledger existed. Run it in chronological order (the command already does) if a
+legacy database needs its inventory reconstructed.
 """
 
 from django.core.management.base import BaseCommand, CommandError
