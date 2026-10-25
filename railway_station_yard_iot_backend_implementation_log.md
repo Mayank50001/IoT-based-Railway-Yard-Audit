@@ -28,7 +28,7 @@ Following `AGENTS.md`, application code is delivered in chat unless code-file ed
 | M1b — Seed data | Repeatable demo station, shared lane, fleet, three plans, initial lane mode | **VERIFIED** (2026-10-25, CP-03) |
 | M2 — Ingestion | Authenticated single/batch event endpoint, UID canonicalisation, idempotency | **VERIFIED** (2026-10-25, CP-04) |
 | M3 — Movement bucket | 20-second receive-time gap, idempotent closure, sweep command | **VERIFIED** for bucket mechanics (CP-04); closure finalisation waits on M4 |
-| M4 — Validation | Direct/fallback plan match, distinct type counts, ultrasonic warning, findings | Next (CP-06) |
+| M4 — Validation | Direct/fallback plan match, distinct type counts, ultrasonic warning, findings | **VERIFIED** (2026-10-25, CP-06) |
 | M5 — Inventory & APIs | RFID-primary inventory, dashboard/history/alert endpoints | Planned |
 | M6 — Simulator | v4 acceptance scenarios through the real ingestion path | Planned |
 | M7 — Firmware | Final ESP32 `main.py` after the API contract is stable | Deferred |
@@ -204,6 +204,14 @@ New tests (24 in `yard/test_ingest.py`) cover: missing/wrong credentials, unknow
 | D-24 | `event_id` contract is `<device_id>-<boot_id>-<sequence>`; the server enforces global uniqueness and treats cross-device reuse as 409 | `boot_id` survives a reboot only if the firmware persists it with the queue, which is exactly what makes a retried event keep its id. Global uniqueness also catches two boards provisioned with the same sequence space. | Server-assigned ids (breaks offline queueing); timestamp-only ids (need a synced clock). |
 | D-25 | Closure mechanics are separate from validation; a closed movement keeps `validation_result = NULL` plus an INFO `VALIDATION_PENDING` finding until CP-06 | Closing a bucket must not require the validation service to exist, but the gap must be visible. NULL honestly means "not validated", and CP-06 can find every such movement and replace the findings atomically. | Marking closed movements `VALID` by default (lies); `UNVERIFIED` by default (wrong meaning). |
 | D-26 | A batch shares one server receive instant, and `last_evidence_at` never moves backwards | A firmware queue drain arrives as one request; giving each event its own increasing timestamp would let a drain straddle a bucket boundary artificially. The backwards guard absorbs clock corrections and late replay. | Per-event wall clock inside a batch; overwriting `last_evidence_at` unconditionally. |
+| D-27 | Findings are upserted by `(movement, code, subject)` and stale ones pruned; alerts are created once and never deleted | Revalidation must correct the current picture without losing when a finding was first seen, and without erasing an acknowledgement, which is an audit fact. Deletion would reset `created_at` and could delete a notification someone already acted on. | Delete-and-recreate findings (loses first-seen time); delete-and-recreate alerts (loses acknowledgements). |
+| D-28 | Validation runs inline at closure, inside the closure transaction | A closed movement's evidence is final at that instant, so the outcome should exist the moment the dashboard can see it. If validation raises, the closure rolls back and the sweep retries, so an unvalidated closed movement cannot be left behind by a crash. | Async/background validation (visible window with `NULL` outcome); a placeholder finding (what CP-04 did). |
+| D-29 | Plan lifecycle is `SCHEDULED → ACTIVE` at bind, `COMPLETED` at closure, and a movement's own plan is re-admitted on revalidation | Follows v4 §5 literally. Because v4 resolves plans at closure, the two status writes happen in one transaction; that is expected, not a bug. Re-admission is required because the plan is already `COMPLETED` when revalidation runs, and dropping it would unbind the plan. | Leaving the plan `COMPLETED` and excluding it from candidates (revalidation would unbind); binding straight to `COMPLETED` (deviates from the stated lifecycle). |
+| D-30 | `LOCOMOTIVE_MISMATCH` is raised only when the plan names **every** expected locomotive; a partial roster is count-only, and `UNAUTHORIZED_MOVEMENT` stays reserved | A freight may legitimately run with two or three locomotives while the plan names only the lead; failing the unnamed extra would reject a normal consist. But a plan that names all of them has claimed their identities, and a different one must not pass just because the count matches. `COUNT_MISMATCH` only proves the number, so identity needs its own signal. `UNAUTHORIZED_MOVEMENT` remains unused because it is too vague to distinguish these cases. | Treating any non-lead locomotive as a mismatch (breaks multi-loco freight); never checking locomotive identity (a wrong second loco passes with a correct count). |
+| D-34 | Locomotive identity is stored as plan-scoped `PlanAssignment` rows, never as a boolean on `RollingStock` | The same unit hauls different rakes on different days, so "is hauling" is a per-movement fact. A static flag would be permanently wrong for some movement and could not say *which* rake, reproducing the `entered`/`exited`-on-master-data mistake the project already rejected. Plan assignments are dynamic, historical, and already carry coaches and wagons. | A `hauls_trains`/`is_hauling` boolean on `RollingStock`; inferring the hauling unit from inventory or from the first locomotive read. |
+| D-31 | `DIRECTION_CONFLICT` is only raised for `ENTRY`; exit anomalies use per-unit `UNEXPECTED_EXIT` | On an exit, "not recorded inside" is already a per-unit failure, so an additional aggregate warning would say the same thing twice. The v4 scenario that motivates `DIRECTION_CONFLICT` is stock already in the yard being "entered" again. | Raising `DIRECTION_CONFLICT` for both directions (double signalling). |
+| D-32 | Inventory anomaly checks read the current inventory row as the pre-movement state | Correct today because CP-06 applies no inventory transitions. CP-07 must freeze the pre-movement state before applying its first transition, otherwise revalidation would compare against its own earlier update. | Guessing the pre-state from `last_movement` (ambiguous when a UID moves twice). |
+| D-33 | Retired (`is_active = False`) stock is excluded from observed counts and reported as `RETIRED_ROLLING_STOCK` | A retired unit must not silently satisfy an expected count, but its tag being read is still evidence worth surfacing. | Counting retired stock normally; silently ignoring it. |
 
 ---
 
@@ -284,6 +292,72 @@ No migration was needed: the CP-02 schema already carried every field ingestion 
 
 A captured batch shares one receive instant. If the clock reports an event older than the lane's last evidence, `last_evidence_at` is left alone rather than moved backwards.
 
+## 6d. Checkpoint CP-06 — RFID-primary validation
+
+| File | Change | Purpose |
+|---|---|---|
+| `backend/yard/validation.py` | new | Composition, plan resolution, findings, outcome, persistence, alerts |
+| `backend/yard/movements.py` | edit | `close_movement()` now validates inside the closure transaction; the `VALIDATION_PENDING` placeholder is gone |
+| `backend/yard/management/commands/revalidate_movements.py` | new | Backfills movements closed under CP-04, and revalidates on demand |
+| `backend/yard/admin.py` | edit | Derived validation fields are read-only (`plan` stays editable as the manual rebind workaround) |
+| `backend/yard/test_validation.py` | new | 34 validation tests |
+| `backend/yard/test_ingest.py` | edit | Closure expectations updated: an outcome now exists immediately |
+
+No migration: every field validation writes already existed.
+
+**Composition** is a distinct-identity view of stored events. Repeated logical observations are kept as evidence and counted once. Retired stock is excluded from counts (D-33). Unknown UIDs are retained and reported.
+
+**Plan resolution** first tries the expected lead locomotive, taking the nearest `expected_start` when several plans match and recording `PLAN_AMBIGUOUS` when it has to break a tie. Only if that fails does it use plan assignments, and only when every usable assignment points at one eligible plan (D-29, D-30). No read means no fabricated observation.
+
+**Locomotive identity** is claimed per unit named by the plan: the lead, plus any locomotive in `PlanAssignment`. When the roster covers `expected_locos`, an observed locomotive outside it is `LOCOMOTIVE_MISMATCH`; each named locomotive that was not read is `MISSING_LOCOMOTIVE_RFID`. A partial roster (lead only, two locomotives expected) is counted but not identified, so an ordinary two- or three-loco freight stays valid (D-30, D-34).
+
+**Findings** stored per movement:
+
+| Code | Severity | Meaning |
+|---|---|---|
+| `UNKNOWN_RFID` | FAIL | UID not registered |
+| `RETIRED_ROLLING_STOCK` | FAIL | Registered but inactive |
+| `UNPLANNED_MOVEMENT` | FAIL | No eligible plan bound |
+| `PLAN_AMBIGUOUS` | WARN | Several plans matched; none was guessed |
+| `LOCOMOTIVE_MISMATCH` | FAIL | A single-loco plan saw a different locomotive |
+| `MISSING_LOCOMOTIVE_RFID` | FAIL | Expected lead locomotive was not read |
+| `COUNT_MISMATCH` | FAIL | Distinct known composition differs from the plan |
+| `DUPLICATE_OBSERVATION` | WARN | Same UID read more than once; counted once |
+| `ULTRASONIC_COUNT_MISMATCH` | WARN | Passages disagree with distinct UIDs; advisory only |
+| `DIRECTION_CONFLICT` | WARN | Most observed units were already in the yard on an `ENTRY` |
+| `ENTRY_ALREADY_PRESENT` | WARN | That UID was already recorded inside |
+| `UNEXPECTED_EXIT` | FAIL | That UID was never recorded inside |
+
+Outcome: no known UID → `UNVERIFIED`; otherwise any FAIL → `FLAGGED`; otherwise `VALID`.
+
+End-to-end smoke test through the real URL configuration, inside a rolled-back transaction against the seeded database (plan `NDLS-IN-FULL`, five UIDs, five passages, one repeated UID):
+
+```text
+batch 200 accepted 11
+movement 1 CLOSED -> VALID | plan: NDLS-IN-FULL | source: LOCOMOTIVE_RFID
+  WARN DUPLICATE_OBSERVATION C0A00002 | UID C0A00002 was read 2 times...
+plan status COMPLETED
+after rollback: movements 0 | plan status SCHEDULED
+```
+
+The CP-04 backfill was exercised the same way:
+
+```text
+would validate #1 ENTRY gate-1 at 2026-10-25 16:47:14
+1 movement(s) would be validated.
+Validated 1 movement(s): VALID 1.
+findings ['ULTRASONIC_COUNT_MISMATCH']
+pending left 0
+```
+
+### Plan window vs demo timing
+
+`expected_start` is written by `seed_demo` at seed time and plans are matched within `PLAN_MATCH_WINDOW_MINUTES` (60). A demo an hour after seeding therefore produces `UNPLANNED_MOVEMENT` — correct behaviour, surprising in rehearsal. Rehearsal step: `python manage.py seed_demo --reset`, which both refreshes `expected_start` and returns the plans to `SCHEDULED` (a used plan is `COMPLETED` and cannot bind again).
+
+### Concurrent plan binding
+
+Two lanes closing against the same plan at the same instant would violate `one_movement_per_plan`. The `IntegrityError` surfaces inside the ingestion transaction, whose retry loop then re-runs closure; by then the plan is bound elsewhere, so the second movement validates as `UNPLANNED_MOVEMENT`. The unique constraint is the arbiter, and the event is still stored exactly once. This is a consequence of D-22's retry, not a special case in validation.
+
 ---
 
 ## 7. Verification status (current)
@@ -295,7 +369,7 @@ python manage.py test yard backend
 python manage.py check
 ```
 
-Result: migrations `0001_initial` and `0002_lanemodechange_and_more` are the whole schema; `yard` (47 tests) plus the 3 pre-existing health tests all pass; `check` reports no issues and no migrations are pending.
+Result: migrations `0001_initial` and `0002_lanemodechange_and_more` are the whole schema; `yard` (81 tests) plus the 3 pre-existing health tests all pass; `check` reports no issues and no migrations are pending.
 
 Then create a superuser and confirm the models appear in `/admin/`:
 
@@ -310,7 +384,7 @@ python manage.py runserver
 
 | Item | State |
 |---|---|
-| Plan reassignment after a wrong bind | Open. A plan may bind to only one movement; the yard master currently has no UI/endpoint to release it. |
+| Plan reassignment after a wrong bind | Open. A plan may bind to only one movement; the yard master currently has no UI/endpoint to release it. `Movement.plan` stays editable in admin as the manual workaround. |
 | Firmware `event_id` format | **Closed (D-24):** `<device_id>-<boot_id>-<sequence>`. The firmware must persist `boot_id` alongside the queue so a retried event keeps its id. |
 | API-key rotation | Hashing and cache invalidation are in place; `seed_demo --rotate-key` and the admin form both work. A dedicated dashboard action belongs in CP-07. |
 | `ALLOWED_HOSTS` for ESP32 on LAN | Configured via `DJANGO_ALLOWED_HOSTS`; the concrete LAN IP is not yet fixed. |
@@ -320,19 +394,25 @@ python manage.py runserver
 | Auth cache across processes | The default locmem cache is per process. With multiple workers, each pays one verification per key per minute; that is acceptable here, and a shared cache fixes it if workers multiply. |
 | Scaffold/version drift | Settings header says Django 4.2.16; the environment actually runs 6.1.2. Code now targets the installed version. Re-check on any environment rebuild. |
 | UID length variety | Canonical form accepts 4–32 hex characters (2–16 bytes) in whole bytes; RC522 4-byte tags are the current case. |
-| Closed movements awaiting validation | Every movement closed by CP-04 carries `validation_result = NULL` and an INFO `VALIDATION_PENDING` finding. CP-06 must validate these too, not only newly closing ones. |
-| Revalidation of a closed movement | Policy defined (replace findings atomically, never repeat inventory transitions); implementation still to come. |
+| Closed movements awaiting validation | **Closed:** `python manage.py revalidate_movements` validates every closed movement with `validated_at IS NULL` and replaces the `VALIDATION_PENDING` placeholder. Verified against a synthetic legacy movement. |
+| Revalidation of a closed movement | **Implemented:** findings are upserted and pruned, alerts are created once, plan binding is stable, and the same events always produce the same outcome. Inventory transitions still have to respect this when CP-07 adds them (D-32). |
 | Inventory-inferred direction | **Rejected by decision D-19.** Never implemented. Only a `DIRECTION_CONFLICT` warning will consult inventory state. |
 | Lane mode unset | **Implemented:** HTTP 409 `LANE_MODE_NOT_SET`, nothing stored. The firmware queue must retain and retry. |
 | Mode change during a backlog drain | A late batch can be ingested after the operator changed the lane mode, giving it the new direction. Same class of problem as delayed replay; mitigate by closing the movement before switching modes. |
 | Operator ergonomics | Setting the mode is currently an admin action. A dedicated dashboard control/API belongs in CP-07. |
 | Lazy closure on read | The sweep closes idle movements; ingestion also rotates a bucket immediately when a later event exceeds the gap. A dashboard read path still has no lazy-close hook (CP-07). |
+| Validation outcome and alerts are stored, nothing reads them yet | Findings and alerts are written and idempotent, but only the admin site can display them. Read APIs are CP-07. |
+| Inventory transitions | **Not implemented.** Validation reports `UNEXPECTED_EXIT` / `ENTRY_ALREADY_PRESENT` against current inventory rows, which are still the pre-movement state. CP-07 must freeze that state before applying its first transition (D-32). |
+| Plan window vs rehearsal timing | Plans are matched within 60 minutes of `expected_start`, which `seed_demo` writes at seed time. Run `python manage.py seed_demo --reset` before a demo rehearsal. |
+| Plan without a lead locomotive | Open by data quality, not by code: `expected_lead_loco` is nullable, so a plan that names no locomotive identity and has no locomotive assignment can only be count-checked. The seed always sets a lead. |
+| Multi-locomotive demo data | No demo plan expects two locomotives yet, because the bench has one locomotive tag. The behaviour is covered by tests; CP-08's simulator will exercise it through the real ingestion path. |
+| Banker/helper locomotive attached en route | **Deferred by the user (2026-10-25) — not a demo concern.** Current behaviour: a complete plan roster plus an unplanned banker yields `LOCOMOTIVE_MISMATCH` + `COUNT_MISMATCH`, i.e. `FLAGGED`. The open question is whether an extra locomotive should stay `FAIL` or become a `WARN`; flipping it is a one-line severity change plus one test. Revisit after the demo. |
 
 ---
 
 ## 9. Next checkpoints
 
-1. **CP-06 — validation:** plan direct/fallback matching, distinct type counts, ultrasonic warning, `DIRECTION_CONFLICT`, findings, and validating the movements CP-04 already closed with `VALIDATION_PENDING`.
-2. **CP-07 — inventory & APIs:** presence updates and station-scoped read APIs, including the operator lane-mode control.
+1. **CP-07 — authentication:** Django-session login/logout/me for yard masters, global `IsAuthenticated` default, station scoping from `StaffProfile`, role checks, and `set_by` on lane-mode changes. Decisions taken with the user: Django-served dashboard (session cookie, not a token), and every account is station-bound with no administrator exception.
+2. **CP-07 — inventory & APIs:** one RFID-primary transition per distinct UID actually read, station-scoped read APIs, and the operator lane-mode control.
 3. **CP-08 — simulator:** acceptance scenarios through the real ingestion path.
 4. **CP-09 — firmware:** final ESP32 `main.py` after the contract is stable.

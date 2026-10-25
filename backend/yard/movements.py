@@ -4,11 +4,10 @@ A movement is one consist passing one lane. Buckets are separated by server
 receive time, not by device clocks: a gap of more than ``MOVEMENT_GAP_SECONDS``
 of silence starts a new movement.
 
-Only closure *mechanics* live here. Validation, findings and inventory effects
-belong to the validation service, which runs at closure. Until that service
-exists (CP-06), a closed movement keeps ``validation_result = NULL`` and carries
-an INFO ``VALIDATION_PENDING`` finding so the gap is visible rather than
-silently treated as verified.
+Closure mechanics live here. The moment a movement becomes ``CLOSED`` its
+stored events are final, so validation runs immediately afterwards in the same
+transaction; an exception during validation rolls the closure back and the
+sweep retries, rather than leaving an unvalidated closed movement behind.
 """
 
 from datetime import timedelta
@@ -18,9 +17,8 @@ from django.db import transaction
 
 from . import clock
 from .exceptions import LaneModeNotSet
-from .models import Device, Direction, Movement, MovementFinding
-
-VALIDATION_PENDING = 'VALIDATION_PENDING'
+from .models import Device, Direction, Movement
+from .validation import validate_movement
 
 
 def gap_seconds():
@@ -96,11 +94,11 @@ def _open_movement(device, received_at):
 
 
 def close_movement(movement, closed_at=None):
-    """Close an open movement exactly once. Returns True if this call did it.
+    """Close an open movement exactly once, then validate it.
 
     The state change is a conditional SQL update, so two sweeps (or a sweep and
-    an ingestion) racing on the same movement cannot both apply it or duplicate
-    the closure finding.
+    an ingestion) racing on the same movement cannot both apply it or validate
+    twice. Validation is idempotent anyway; the guard prevents duplicate work.
     """
     closed_at = closed_at or clock.server_now()
 
@@ -120,18 +118,7 @@ def close_movement(movement, closed_at=None):
     movement.state = Movement.State.CLOSED
     movement.closed_at = closed_at
 
-    MovementFinding.objects.get_or_create(
-        movement=movement,
-        code=VALIDATION_PENDING,
-        subject='',
-        defaults={
-            'severity': MovementFinding.Severity.INFO,
-            'message': (
-                'Movement closed. RFID-primary validation is not implemented '
-                'yet; this finding is replaced when the movement is validated.'
-            ),
-        },
-    )
+    validate_movement(movement)
     return True
 
 

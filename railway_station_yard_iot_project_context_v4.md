@@ -165,6 +165,10 @@ Retain the existing movement-plan information:
 
 Multiple locomotives are supported through `expected_locos`; the lead locomotive provides the normal plan-matching identity. Additional locomotive identities are not claimed to be validated individually unless explicitly included in plan assignments.
 
+Locomotive identity is claimed **per unit named**, never inferred from the count. If the assignments name every expected locomotive, the plan has claimed their identities and a different observed locomotive is a failure (`LOCOMOTIVE_MISMATCH`). If they name only some, the unnamed remainder is counted but not identified, so a different second locomotive is legitimate and is caught only if the count is wrong. This keeps an ordinary multi-loco freight valid while still failing a rake whose named locomotive did not turn up.
+
+Locomotive identity is deliberately **not** a flag on the rolling-stock master. The same unit hauls different rakes on different days, so a boolean on `RollingStock` cannot answer "is this the locomotive for this movement"; the plan-scoped assignment can. A static property such as `kind = LOCO` or `is_active` describes the unit, not the rake.
+
 Home shed, division, and zone are rolling-stock master data. Division and zone are optional additions requested in the current discussion. Current yard presence is derived from movement/inventory records, not from two independently editable `entered`/`exited` booleans.
 
 ### Current plan assignments
@@ -232,6 +236,25 @@ The closed outcome procedure is:
 `VALID` now means **the required RFID-based checks passed**. It does not mean both sensors independently verified each unit, or that an exact coach roster was checked.
 
 Save the expected and observed numbers behind every finding. The dashboard reads stored findings rather than recomputing business rules. Revalidation replaces findings atomically and must not duplicate alerts or inventory effects.
+
+Implemented finding codes (severity is fixed per code; `subject` is the UID or unit number where the finding is about one unit):
+
+| Code | Severity | Raised when |
+|---|---|---|
+| `UNKNOWN_RFID` | `FAIL` | A read UID has no rolling-stock master row |
+| `RETIRED_ROLLING_STOCK` | `FAIL` | A read unit is inactive, so it cannot satisfy a count |
+| `UNPLANNED_MOVEMENT` | `FAIL` | No eligible plan could be bound |
+| `PLAN_AMBIGUOUS` | `WARN` | Several eligible plans matched, so none was guessed |
+| `LOCOMOTIVE_MISMATCH` | `FAIL` | A plan naming every expected locomotive saw a different one |
+| `MISSING_LOCOMOTIVE_RFID` | `FAIL` | A named locomotive (the lead, or a roster member) was not read |
+| `COUNT_MISMATCH` | `FAIL` | Distinct known composition differs from the plan, by type |
+| `DUPLICATE_OBSERVATION` | `WARN` | One UID was read more than once; still one unit |
+| `ULTRASONIC_COUNT_MISMATCH` | `WARN` | Passage total differs from the distinct UID total |
+| `DIRECTION_CONFLICT` | `WARN` | Most observed units were already in the yard on an `ENTRY` |
+| `ENTRY_ALREADY_PRESENT` | `WARN` | That unit was already recorded inside the yard |
+| `UNEXPECTED_EXIT` | `FAIL` | That unit was never recorded inside the yard |
+
+Alerts are notifications: one per failing or warning finding, created once, never deleted, and acknowledging one does not change the finding. Findings are current state and are replaced when a movement is revalidated.
 
 ## 7. Ultrasonic as the safety net
 

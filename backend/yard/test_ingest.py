@@ -396,13 +396,15 @@ class MovementBucketTests(IngestTestCase):
         first, second = Movement.objects.order_by('started_at', 'id')
         self.assertEqual(first.state, Movement.State.CLOSED)
         self.assertEqual(first.closed_at, at(15))
-        self.assertTrue(
+        # Closure now validates immediately; the temporary placeholder from
+        # CP-04 must not survive.
+        self.assertIsNotNone(first.validated_at)
+        self.assertFalse(
             MovementFinding.objects.filter(
                 movement=first,
                 code='VALIDATION_PENDING',
             ).exists()
         )
-        self.assertIsNone(first.validation_result)
         self.assertEqual(second.state, Movement.State.OPEN)
         self.assertEqual(second.started_at, at(36))
 

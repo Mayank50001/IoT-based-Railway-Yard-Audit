@@ -178,7 +178,20 @@ class MovementAdmin(admin.ModelAdmin):
         'closed_at',
     )
     list_filter = ('station', 'direction', 'state', 'validation_result')
-    readonly_fields = ('created_at', 'updated_at', 'validated_at')
+    # Validation is authoritative: its output is not hand-edited. ``plan`` stays
+    # editable on purpose, as the current manual workaround for a wrong bind.
+    readonly_fields = (
+        'created_at',
+        'updated_at',
+        'validated_at',
+        'validation_policy',
+        'validation_result',
+        'plan_match_source',
+        'expected_locos',
+        'expected_coaches',
+        'expected_wagons',
+        'expected_lead_loco',
+    )
     inlines = (MovementEventInline, MovementFindingInline)
 
 
