@@ -1,0 +1,18 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>{% block title %}Sign in{% endblock %} · Yard Monitor</title>
+  <link rel="stylesheet" href="{% static 'yard/dashboard.css' %}">
+</head>
+<body class="auth-body" data-page="{% block page %}{% endblock %}" {% block body_attrs %}{% endblock %}>
+  <main class="auth-shell">
+    {% block content %}{% endblock %}
+  </main>
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <script src="{% static 'yard/dashboard.js' %}" defer></script>
+</body>
+</html>

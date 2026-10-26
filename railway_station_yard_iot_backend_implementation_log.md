@@ -31,8 +31,9 @@ Following `AGENTS.md`, application code is delivered in chat unless code-file ed
 | M4 — Validation | Direct/fallback plan match, distinct type counts, ultrasonic warning, findings | **VERIFIED** (2026-10-25, CP-06) |
 | M5a — Authentication & lane control | Session login/logout/me, station scoping, roles, audited lane mode, `create_staff` | **VERIFIED** (2026-10-25, CP-07a; 122 tests then) |
 | M5b — Inventory & read APIs | Frozen pre-movement inventory effects, station-scoped movement/finding/alert/inventory reads | **VERIFIED** (2026-10-25, CP-07b; 154 tests) |
-| M6 — Simulator | v4 acceptance scenarios through the real ingestion path | Planned |
-| M7 — Firmware | Final ESP32 `main.py` after the API contract is stable | Deferred |
+| M6 — Dashboard | Django-served pages over the read APIs: overview, lanes, movements, movement detail, inventory, alerts; IST display and live refresh | **VERIFIED** (2026-10-26, CP-08; 169 tests, assistant-run) |
+| M7 — Firmware | ESP32 `main.py`: independent RFID/passage events, off-line queue, NTP-optional clock, documented retry policy | **APPLIED** (2026-10-26, CP-09; 29 logic tests and a live HTTP check pass, hardware run pending) |
+| M8 — Rehearsal | Real sensors plus seeded master data, no simulator | Planned |
 
 ---
 
@@ -130,7 +131,7 @@ Seeded plans:
 | `NDLS-IN-FULL` | `ENTRY` | `WAP7-3020` (`A0A00002`) | 1 loco + 4 coaches | `NR-C-2202`–`2205` |
 | `NDLS-OUT-FULL` | `EXIT` | `WAP7-3020` | 1 loco + 4 coaches | `NR-C-2202`–`2205` |
 
-The bench plan is bound to the two tags the user physically owns, so a real two-unit demonstration is possible today. The 4-coach plans are for the simulator. Plan status is intentionally **not** reset on re-seed, because a plan already used by a movement must keep its lifecycle. `--reset` deletes demo movements, inventory, and plans for NDLS only; master data and the lane key survive.
+The bench plan is bound to the two tags the user physically owns, so a real two-unit demonstration is possible today. The 4-coach plans are for a fuller consist when more coach tags are available; they are not required for the two-tag bench. Plan status is intentionally **not** reset on re-seed, because a plan already used by a movement must keep its lifecycle. `--reset` deletes demo movements, inventory, and plans for NDLS only; master data and the lane key survive.
 
 ### M2/M3 — Ingestion and movement buckets (CP-04)
 
@@ -228,6 +229,20 @@ New tests (24 in `yard/test_ingest.py`) cover: missing/wrong credentials, unknow
 | D-31 | `DIRECTION_CONFLICT` is only raised for `ENTRY`; exit anomalies use per-unit `UNEXPECTED_EXIT` | On an exit, "not recorded inside" is already a per-unit failure, so an additional aggregate warning would say the same thing twice. The v4 scenario that motivates `DIRECTION_CONFLICT` is stock already in the yard being "entered" again. | Raising `DIRECTION_CONFLICT` for both directions (double signalling). |
 | D-32 | Inventory anomaly checks read the current inventory row as the pre-movement state | At CP-06 that was correct because no inventory transitions were applied. The requirement it established — freeze the pre-movement state before the first transition — was implemented in CP-07b as `MovementInventoryEffect` (D-45). | Guessing the pre-state from `last_movement` (ambiguous when a UID moves twice). |
 | D-33 | Retired (`is_active = False`) stock is excluded from observed counts and reported as `RETIRED_ROLLING_STOCK` | A retired unit must not silently satisfy an expected count, but its tag being read is still evidence worth surfacing. | Counting retired stock normally; silently ignoring it. |
+| D-50 | Dashboard pages are thin Django shells; browser code reads the existing station-scoped API instead of server-side views duplicating its queries | The read API already owns scoping, pagination, lazy closure, and serialisation. Rendering a second queryset path in templates would create two places to keep the station boundary correct, and a mistake in the quieter one would be invisible in API tests. One contract also means the firmware, dashboard, and any future client see identical facts. | Duplicating the ORM queries in `TemplateView`s; adopting a separate SPA build toolchain for a prototype. |
+| D-51 | Page access mirrors the API: anonymous → login redirect with `next`; missing/inactive profile → an explanatory HTML 403 with the API code; foreign movement → 404 before JavaScript runs | The dashboard must not become a weaker access path than the JSON surface. A denied page that says `NO_STAFF_PROFILE` is more useful than a shell that later fills with API errors, and resolving the movement server-side prevents a foreign id from rendering even briefly. | Client-only guards (a page that flashes before redirecting); redirecting every error to login. |
+| D-52 | The simulator is dropped. The demonstration uses real sensors and seeded master data; CP-08 became the dashboard, and firmware remains the next code checkpoint | The user explicitly needs to demonstrate the physical sensing path, not a scripted replay. Keeping an unverified simulator would add a command that can stall during the demo and would create non-physical rows in the yard database. Seeded master data supplies plans and stock identities without pretending to be sensor evidence. | An acceptance-scenario simulator; seeding fake movements and calling them sensor data. |
+| D-53 | The browser formats timestamps explicitly in `Asia/Kolkata`; storage and API stay UTC | v4 requires "store UTC, display IST". Relying on the laptop's timezone makes the same page show different times on different machines, and labelling an unsynchronised clock as UTC would be false. An explicit formatter keeps the display policy in one place. | Browser-local time; formatting dates on the server in a fixed offset while storage stays UTC. |
+| D-54 | Live pages poll the read API every 5 s (overview, lanes, movements, open movement detail) or 10 s (inventory, alerts), paused while the tab is hidden | A websocket adds a channel layer, reconnect handling, and a second update path for a single-yard prototype. Polling reuses the authenticated API, and the movement-detail poll stops once the movement is `CLOSED`, so final data costs nothing. The trade-off is up to 20 requests per minute per open tab. | WebSockets/SSE; manual refresh only (the audience would watch a stale screen while sensors fire). |
+| D-55 | Dashboard writes remain limited to lane mode and alert acknowledgement; plan reassignment stays an admin operation | Both dashboard writes already have audited endpoints and role checks. Adding inline plan editing would create a new mutation path with no acceptance scenario, while the admin remains the deliberate manual workaround for a wrong bind. | A dashboard plan editor; hiding the wrong-bind problem. |
+| D-56 | `GET /api/movements` and detail expose `direction_source` so the UI can show whether direction came from the lane mode, a plan, or inventory inference | v4 makes direction an audited operator fact. Showing only `ENTRY`/`EXIT` loses that provenance, and a future `INFERRED` value would be indistinguishable from an operator decision. This is a read-only field with no migration. | Leaving the source out and asking the operator to trust the label. |
+| D-57 | The firmware emits `RFID_DETECTED` and `PHYSICAL_PASSAGE` as independent events and never pairs them | v4 validates on distinct registered UIDs and treats passage counts as advisory. If the device paired a passage with a card read, a missed locomotive could be filled in by the device and `MISSING_LOCOMOTIVE_RFID` would stop being observable. Keeping the streams separate also lets the server apply the lane direction and plan window, which the device does not know. | Pairing on the device; one composite "vehicle passed with UID" event. |
+| D-58 | Queued events are one JSON file per event, written to `.tmp` and renamed, bounded at 2000 with oldest-first loss | Rename is the only atomicity primitive MicroPython offers, and a single index file is a single point of corruption. Per-file records survive a power cut mid-write and let `event_id` be fixed at enqueue, so a reboot does not rename pending events. Dropping the oldest on overflow keeps the train currently at the gate, which is what a demo needs. | One JSON-lines log; an in-RAM queue; dropping the newest on overflow. |
+| D-59 | Events carry no `timestamp` until NTP has synchronised; the server's `received_at` orders everything | A cold-boot clock reads 2000-01-01, and a wrong but plausible-looking device timestamp is worse than none in an audit trail. Movements are bucketed by server receive time by decision, so the device clock is optional metadata. | Setting the clock from `time.time()` at boot; refusing to emit until synced. |
+| D-60 | Retry delays depend on the failure: 409 → 5 s, 401/403 → 60 s, other 4xx/429 → 30 s, 5xx/transport → exponential to 30 s | A 409 is one operator click away from working, so five seconds is right. A 401 will not fix itself in five seconds and hammering it wastes radio time and fills the log. Rejected events are deleted rather than retried, because a malformed event never becomes well-formed. | One fixed retry interval for everything; dropping the queue on any error. |
+| D-61 | Ultrasonic detection uses hysteresis (enter 140 cm, exit 150 cm) with sample confirmation, and treats a missing echo as "unknown", never "clear" | Readings hovering at a single threshold would chatter and produce several passages per vehicle. Requiring four clear samples rejects a single dropout, and holding an open passage through missing echoes prevents a dead sensor from fabricating an exit and splitting one movement into two. | A single distance threshold; treating a timeout as clear. |
+| D-62 | The HC-SR04 Echo line stays wired directly to GPIO 25, with the out-of-spec 5 V condition documented rather than blocked | The pin is not 5 V tolerant, but this exact wiring has run on the bench for roughly two years without a failure, and the user needs the rig working rather than rewired. A 1 kΩ series plus 2 kΩ to ground divider is documented in the firmware README as the containment. | Refusing to ship until a divider is fitted; a level shifter on a breadboard. |
+| D-63 | The firmware reads 4-byte UIDs only, and the backend's 4–32 hex character rule is unchanged | `anticoll` at cascade level 1 covers the bench tags. Adding cascade level 2 would be untested code in the demo path, and the server already accepts longer UIDs if a future driver produces them. | Implementing both cascade levels now; narrowing the API to 4-byte UIDs. |
 
 ---
 
@@ -549,7 +564,179 @@ The read tests cover: 401 on every route without a session; station-filtered lis
 
 ### What CP-07b deliberately does not include
 
-Dashboard templates, the simulator, and any write endpoint other than alert acknowledgement and lane mode. Those are CP-08 and later. Movements validated before this checkpoint did not apply inventory; on an existing database, only a deliberate `revalidate_movements --all` (in chronological order) would reconstruct it. `seed_demo --reset` avoids the question for a demo.
+Dashboard templates, the simulator, and any write endpoint other than alert acknowledgement and lane mode. Those were CP-08 and later at the time of this checkpoint; the simulator was subsequently dropped by user decision (D-52), and the dashboard shipped as CP-08. Movements validated before this checkpoint did not apply inventory; on an existing database, only a deliberate `revalidate_movements --all` (in chronological order) would reconstruct it. `seed_demo --reset` avoids the question for a demo.
+
+---
+
+## 6g. Checkpoint CP-08 — dashboard and real-sensor demo scope
+
+**Status:** applied and verified by the assistant on 2026-10-26.
+
+The user removed the simulator from scope: the demonstration will use the physical ESP32/RC522/ultrasonic bench, and any missing fleet or plan data is seeded. CP-08 therefore delivered the operator dashboard, and CP-09 is the firmware.
+
+### Pages and access
+
+```text
+GET  /                  -> overview (cards, open movements, latest movement)
+GET  /lanes/            -> lane list, mode control, open-movement link
+GET  /movements/        -> filterable history (state, direction, result, lane)
+GET  /movements/<id>/   -> findings, alerts, events, inventory effects, counts
+GET  /inventory/        -> status, verification, UID search, last movement
+GET  /alerts/           -> severity/open filters, acknowledgement
+GET  /login/            -> sign-in form
+POST /logout/           -> CSRF-protected session end
+```
+
+The page guard runs before any data is fetched:
+
+- anonymous → `302` to `/login/?next=<full path>`;
+- authenticated but no profile / inactive profile / inactive station → HTML `403` carrying `NO_STAFF_PROFILE`, `STAFF_INACTIVE`, or `STATION_INACTIVE`;
+- another station's movement → `404` from `get_station_object_or_404`, identical to a missing id.
+
+Once the shell loads, the browser calls the existing JSON API with the session cookie. Unsafe calls send `X-CSRFToken`. A `401` during polling redirects to login with the current path, so an expired shift does not leave a silently stale screen.
+
+### Files
+
+| File | Change | Purpose |
+|---|---|---|
+| `backend/yard/dashboard_views.py` | new | Page guard, login/logout pages, seven dashboard pages |
+| `backend/yard/dashboard_urls.py` | new | HTML routes at the site root |
+| `backend/backend/urls.py` | modified | Mount the dashboard after `/api/`, `/admin/`, and `/health` |
+| `backend/yard/templates/yard/base.html` | new | Authenticated shell, navigation, CSRF meta, identity, sign-out |
+| `backend/yard/templates/yard/base_public.html` | new | Login/denied shell |
+| `backend/yard/templates/yard/login.html` | new | Sign-in form |
+| `backend/yard/templates/yard/denied.html` | new | Explanatory 403 with sign-out |
+| `backend/yard/templates/yard/overview.html` | new | Station totals, open movements, latest movement |
+| `backend/yard/templates/yard/lanes.html` | new | Lane table and mode control |
+| `backend/yard/templates/yard/movements.html` | new | Filter form and paginated history |
+| `backend/yard/templates/yard/movement_detail.html` | new | Counts, findings, alerts, events, effects |
+| `backend/yard/templates/yard/inventory.html` | new | Inventory filters and table |
+| `backend/yard/templates/yard/alerts.html` | new | Alert filters, acknowledgement |
+| `backend/yard/static/yard/dashboard.css` | new | Small dependency-free layout and badge styles |
+| `backend/yard/static/yard/dashboard.js` | new | API loaders, CSRF, IST formatting, polling, ack/mode actions |
+| `backend/yard/serializers.py` | modified | Expose `direction_source` on movement summaries (read-only) |
+| `backend/yard/test_dashboard.py` | new | 15 page/access/asset tests |
+
+### Verification
+
+```text
+$ python manage.py test yard backend
+Ran 169 tests in 11.0s
+OK
+
+$ python manage.py check
+System check identified no issues (0 silenced).
+
+$ python manage.py makemigrations --check --dry-run
+No changes detected
+```
+
+Browser smoke against the dev database (assistant-run, then cleaned up):
+
+- Login succeeded through `/api/auth/login`; the overview loaded live totals and `Updated … IST` with no console errors.
+- `ENTRY → EXIT → ENTRY` on `gate-1` produced the expected toast and `applies_to` message; the temporary audit rows were removed afterwards.
+- One real `RFID_DETECTED` event on a temporary `ui-lane`, bound to a temporary `UI-SMOKE` plan, closed after the 20-second gap. The detail page showed `CLOSED`/`FLAGGED`, 1 loco against 1 expected, `COUNT_MISMATCH` (FAIL) and `ULTRASONIC_COUNT_MISMATCH` (WARN), one event, and one `absent → IN_YARD` effect.
+- The alert acknowledgement endpoint recorded `ui-smoke` and the detail re-rendered without a reload.
+- Inventory showed the UID as `IN_YARD` / `UNVERIFIED` with a link to movement 77; movement filters and alert filters reflected their URL values.
+- Deleting the smoke account while a tab polled produced `401` on the next read and redirected to `/login/?next=…`; this was observed in the server log, not inferred.
+- Cleanup restored `NDLS` to one lane (`gate-1`, `ENTRY`), 3 plans, 10 registered stock, 0 movements/events/findings/alerts/effects/inventory, and the original seed `LaneModeChange`. No `SIM` station or rows remain.
+
+### What CP-08 deliberately does not include
+
+- ESP32 firmware (CP-09), a scheduler, or a websocket/SSE transport.
+- Plan reassignment from the dashboard; the Django admin remains the manual workaround.
+- A no-JavaScript fallback. The pages are shells by design (D-50); with JavaScript disabled they show their loading placeholders.
+- A favicon. The server logs a harmless `404 /favicon.ico` in the browser.
+
+---
+
+## 6h. Checkpoint CP-09 — ESP32 lane firmware
+
+**Status:** applied; logic and HTTP transport verified by the assistant on 2026-10-26. A hardware run on the bench is the remaining step.
+
+The firmware is deliberately dumb. It senses, timestamps if it can, and reports. Direction, bucket boundaries, plan matching, distinct-UID counts, validation, inventory, and alerts all stay on the server, so a device with a stale or wrong idea cannot corrupt the yard record.
+
+### Files
+
+| File | Purpose |
+|---|---|
+| `firmware/main.py` | Wi-Fi association, NTP clock, HTTP client, queue drain, sensor loop |
+| `firmware/logic.py` | Portable rules: hysteresis detector, per-UID gate, tick arithmetic, event ids, backoff, queue |
+| `firmware/mfrc522.py` | Minimal RC522 driver (`request`, `anticoll`, `read_uid`) |
+| `firmware/config.example.py` | Committed template: pins, thresholds, API and Wi-Fi placeholders |
+| `firmware/tests/test_logic.py` | 29 CPython tests over `logic.py` |
+| `firmware/README.md` | Wiring, provisioning, upload, tuning, troubleshooting, limits |
+
+`firmware/config.py` is gitignored and holds the Wi-Fi password and device key.
+
+### Two independent event streams
+
+| Event | Emitted | Payload |
+|---|---|---|
+| `RFID_DETECTED` | A UID is read and its per-UID cooldown has elapsed | `rfid_uid`, optional `timestamp` |
+| `PHYSICAL_PASSAGE` | The zone becomes occupied and then clears | `timestamp` = zone entry, `metadata.started_at/ended_at/duration_ms/min_distance_cm/peak_distance_cm` |
+
+The two are never paired at the device. v4 requires a correct miss to look like a miss: if the firmware invented a card read to fill a passage, `MISSING_LOCOMOTIVE_RFID` could never fire. Passage counts stay advisory, so their only job is `ULTRASONIC_COUNT_MISMATCH` as a warning.
+
+### Sensor rules
+
+- Ultrasonic hysteresis: occupied below 140 cm, clear above 150 cm, 3 occupied samples, 4 clear samples, 120 ms minimum passage, 30 s maximum open passage.
+- A **missing echo never clears an occupied zone.** A dead or blocked sensor must not split one vehicle into two passages; it can only fail to report one at all.
+- The passage timestamp is zone entry, per v4, even though the event is written on exit.
+- UID state is per UID, not "last UID": alternating two tags refreshes both timers instead of making the first look new. Cooldown 3 s, refreshed on every successful raw read, bounded to 32 tracked UIDs.
+- Entry time is the first sub-threshold sample, not the confirming one, so the passage timestamp does not drift by the confirmation window.
+
+### Transport and durability
+
+- One JSON file per event in `/queue`, written to `NNNNNNNN.json.tmp` then renamed, so a power cut cannot leave a half-record behind. `event_id` is assigned at enqueue and stored in the file, so a reboot with a new boot id does not rename queued events.
+- Bound of 2000 events, dropping the oldest and counting the loss: the newest events describe the train at the gate, which is what the tester needs.
+- Batches of 25. `accepted`, `duplicate`, and `rejected` all delete the file — `duplicate` is the normal outcome of retrying a batch whose 200 the device never saw.
+- Kept and retried: `409` after 5 s (lane mode unset), `401/403` after 60 s, other `4xx` and `429` after 30 s, `5xx`/transport with exponential backoff to 30 s.
+- Rejections are logged with the server's code and message; they are not retried, because a malformed event will never become well-formed.
+
+### Clock policy
+
+Until NTP answers, events carry **no** `timestamp` field. The server buckets by `received_at`, so an unsynced clock costs nothing and a wrong clock is impossible. This was a deliberate choice: a device clock set from `time.time()` after a cold boot returns 2000-01-01, which would look like real evidence in the audit trail.
+
+The clock's `iso(offset)` helper allows the passage event to report its entry time even though it is written later.
+
+### Verification
+
+```text
+$ cd firmware && ../env/bin/python -m unittest discover -s tests -v
+Ran 29 tests in 0.013s
+OK
+
+$ ../env/bin/python -m py_compile logic.py mfrc522.py main.py config.example.py
+compile ok
+```
+
+Live HTTP integration, run by the assistant against the real Django server with `machine`, `network`, `mfrc522`, and `config` stubbed, using the firmware's own transport code:
+
+- unsynced clock omits `timestamp`; synced clock produces `...Z` and a passage whose `timestamp` equals `metadata.started_at`;
+- real `POST /api/ingest/events` → `200`, `accepted: 2`, events deleted from the queue;
+- an event missing `rfid_uid` → `rejected` with `MISSING_RFID_UID`, file deleted;
+- wrong key → `401 DEVICE_AUTH_FAILED`, file **retained**;
+- `409` schedules 5 s and `500` schedules its backoff step.
+
+That harness found a real defect before any hardware was involved: `_read_response` called `recv` but never appended the chunk, so every response was discarded and the device reported `connection closed before response headers` while the server log showed `200`. One missing `data += chunk`. It is exactly the class of bug that would have looked like a network problem on the bench.
+
+### Decisions visible in the implementation
+
+- **Independent events (D-57).** The firmware emits raw evidence only; any grouping decision belongs to the server.
+- **File-per-event queue (D-58).** No database, no single index file to corrupt: rename is the only atomicity primitive MicroPython offers.
+- **No timestamps before NTP (D-59).**
+- **Per-status retry schedule (D-60).** A 409 is an operator action away; a 401 is a credential problem that will not fix itself in five seconds.
+- **Ultrasonic hysteresis with missing-echo hold (D-61).**
+- **Echo wired directly to GPIO 25 (D-62).** Out of spec, retained at the user's direction after roughly two years of service; a 1 kΩ/2 kΩ divider is documented as the fix.
+
+### What CP-09 deliberately does not include
+
+- 7-byte UID support (cascade level 2). Only 4-byte tags are read, which matches the bench.
+- RC522 anticollision for more than one tag in the field at once.
+- Config editing from the dashboard or a provisioning hotspot; the key is pasted into `config.py`.
+- TLS certificate validation, local clock persistence, and over-the-air updates.
+- Any interpretation of the data. The firmware never counts, matches, or judges.
 
 ---
 
@@ -562,16 +749,28 @@ python manage.py test yard backend
 python manage.py check
 ```
 
-Result: migrations `0001_initial`, `0002_lanemodechange_and_more`, and `0003_movementinventoryeffect` are the whole schema; `yard` (151 tests) plus the 3 pre-existing health tests all pass (154 total); `check` reports no issues and no migrations are pending.
+Result: migrations `0001_initial`, `0002_lanemodechange_and_more`, and `0003_movementinventoryeffect` are the whole schema; `yard` (166 tests) plus the 3 pre-existing health tests all pass (169 total); `check` reports no issues and no migrations are pending.
 
-Then create a dashboard account and confirm the session surface:
+Firmware logic is verified separately, without hardware:
+
+```bash
+cd firmware
+../env/bin/python -m unittest discover -s tests -v
+```
+
+Result: 29 tests pass. The real HTTP path was exercised against the running Django server with the hardware modules stubbed; see CP-09.
+
+Then create a dashboard account and open the dashboard:
 
 ```bash
 python manage.py migrate
+python manage.py seed_demo --reset
 python manage.py create_staff --username yard1 --station NDLS --role YARD_MASTER
 python manage.py runserver
-# GET /api/auth/csrf, then POST /api/auth/login, then GET /api/overview
+# open http://127.0.0.1:8000/ and sign in as yard1
 ```
+
+For a phone or another laptop on the LAN, run `python manage.py runserver 0.0.0.0:8000` and set `DJANGO_ALLOWED_HOSTS` to the server's LAN address (comma-separated if needed). The JSON surface remains at `/api/`; the dashboard consumes it.
 
 A superuser for the Django admin site is separate and still created with `createsuperuser`. The admin site is not station-scoped; see D-43.
 
@@ -596,15 +795,25 @@ A superuser for the Django admin site is separate and still created with `create
 | Inventory-inferred direction | **Rejected by decision D-19.** Never implemented. Only a `DIRECTION_CONFLICT` warning will consult inventory state. |
 | Lane mode unset | **Implemented:** HTTP 409 `LANE_MODE_NOT_SET`, nothing stored. The firmware queue must retain and retry. |
 | Mode change during a backlog drain | A late batch can be ingested after the operator changed the lane mode, giving it the new direction. Same class of problem as delayed replay; mitigate by closing the movement before switching modes. |
-| Operator ergonomics | Lane mode is settable through `POST /api/lanes/<device_id>/mode` and the admin. Dashboard templates are not built yet. |
+| Operator ergonomics | **Closed for the demo:** lane mode and alert acknowledgement work from the dashboard with role checks and `set_by`; plan reassignment remains admin-only (D-55). |
 | Lazy closure on read | **Implemented:** movement detail/list, inventory, and overview settle idle buckets before answering (D-49). |
-| Validation outcome and alerts are stored, nothing reads them yet | **Closed:** `/api/movements`, `/api/movements/<id>`, `/api/findings`, and `/api/alerts` are station-scoped read APIs. The dashboard templates are still pending. |
+| Validation outcome and alerts are stored, nothing reads them yet | **Closed:** the station-scoped read APIs and the dashboard read stored findings, alerts, counts, events, and effects. |
 | Inventory transitions | **Implemented:** one transition per distinct read UID, frozen pre-movement state, no replay on revalidation (D-45…D-48). |
 | Inventory for movements validated before CP-07b | Those movements never applied inventory, because the effect ledger did not exist. A deliberate chronological `revalidate_movements --all` would reconstruct it; `seed_demo --reset` is simpler for a demo. |
-| Dashboard pages | Not built. The JSON read API is complete enough for CP-08/CP-09 to render it. |
+| Dashboard pages | **Closed:** seven station-scoped pages at the site root, with a server-side page guard and live API loading (D-50/D-51). |
+| Dashboard requires JavaScript | Accepted prototype limitation. Pages are shells so the read contract has one implementation; with JavaScript disabled they remain at their loading state. A server-rendered fallback would duplicate every query and scoping rule. |
+| Dashboard polling load | Two requests every 5 s on overview/lanes/movements (one on detail), and one every 10 s on inventory/alerts, per open tab. Fine for a single-yard demo; a tablet left open all day should be closed or the interval raised. |
+| Simulator | **Dropped by user decision (D-52).** The demo uses physical sensors plus seeded master data. CP-08 is the dashboard; no simulator command remains in the repository. |
+| Firmware queue durability | **Implemented:** one file per event, atomic rename, corrupt and `.tmp` records discarded at load, `event_id` persisted with the event (D-58). Verified by tests across a simulated restart and by a live queue drain and 401 retention. |
+| Firmware clock | **Settled (D-59):** no `timestamp` until NTP answers. The server's `received_at` is the ordering fact, so an unsynced device is harmless. What is still unknown is how reliably this bench's Wi-Fi reaches an NTP server; the first hardware run will show it in the start log. |
+| Firmware 7-byte UIDs | Open, low risk. `mfrc522.py` implements cascade level 1 only, so NTAG-style 7-byte tags read as no tag. Bench tags are 4-byte. The server would accept a longer UID unchanged. |
+| Firmware: two tags in the field at once | Open. No anticollision loop, so two simultaneous tags may read as one or as neither. The demo presents tags one at a time. |
+| HC-SR04 Echo level | **Accepted risk (D-62).** Echo drives GPIO 25 at ~5 V against a 3.3 V pin. It has worked on this bench for about two years; a 1 kΩ/2 kΩ divider is the documented fix and needs no firmware change. |
+| Firmware HTTPS | Untested. `https://` is supported only if the flashed build has `ssl`, and no certificate validation is performed. The demo runs plain HTTP on the LAN. |
+| Firmware run on real hardware | **Pending.** Logic rules and the HTTP contract are verified, and a real defect in response reading was found and fixed before flashing. Nothing in CP-09 has yet been run on the ESP32. |
 | Plan window vs rehearsal timing | Plans are matched within 60 minutes of `expected_start`, which `seed_demo` writes at seed time. Run `python manage.py seed_demo --reset` before a demo rehearsal. |
 | Plan without a lead locomotive | Open by data quality, not by code: `expected_lead_loco` is nullable, so a plan that names no locomotive identity and has no locomotive assignment can only be count-checked. The seed always sets a lead. |
-| Multi-locomotive demo data | No demo plan expects two locomotives yet, because the bench has one locomotive tag. The behaviour is covered by tests; CP-08's simulator will exercise it through the real ingestion path. |
+| Multi-locomotive demo data | No demo plan expects two locomotives because the bench has one locomotive tag. The behaviour is covered by tests only; it is not part of the physical demo. The former simulator reference is withdrawn with D-52. |
 | Banker/helper locomotive attached en route | **Deferred by the user (2026-10-25) — not a demo concern.** Current behaviour: a complete plan roster plus an unplanned banker yields `LOCOMOTIVE_MISMATCH` + `COUNT_MISMATCH`, i.e. `FLAGGED`. The open question is whether an extra locomotive should stay `FAIL` or become a `WARN`; flipping it is a one-line severity change plus one test. Revisit after the demo. |
 
 ---
@@ -613,5 +822,6 @@ A superuser for the Django admin site is separate and still created with `create
 
 1. **CP-07a — authentication:** **done and verified.** Django-session login/logout/me for yard masters, global `IsAuthenticated` default, station scoping from `StaffProfile`, role checks, and `set_by` on lane-mode changes. Decisions taken with the user: Django-served dashboard (session cookie, not a token), and every account is station-bound with no administrator exception.
 2. **CP-07b — inventory & read APIs:** **done and verified.** One RFID-primary transition per distinct UID actually read, a frozen pre-movement snapshot, and station-scoped movement/finding/alert/inventory read APIs, including alert acknowledgement.
-3. **CP-08 — simulator:** acceptance scenarios through the real ingestion path, including a multi-locomotive plan, retries, unknown tags, and unexpected exits.
-4. **CP-09 — dashboard and firmware:** Django-served templates over the read APIs, then the final ESP32 `main.py` after the contract is stable.
+3. **CP-08 — dashboard:** **done and verified.** Seven Django-served pages over the read APIs, with server-side session/station guards, lane-mode control, alert acknowledgement, IST display, and live refresh. The simulator was dropped by user decision; the demo uses real sensors plus seeded master data (D-52).
+4. **CP-09 — firmware:** **applied, hardware run pending.** ESP32 `main.py` plus `logic.py`, `mfrc522.py`, a committed config template, 29 logic tests, and a README with wiring, provisioning, tuning, and troubleshooting. Verified against the live API; the remaining step is the bench run.
+5. **CP-10 — integrated rehearsal:** run `seed_demo --reset`, create the demo account, start the server, and exercise the physical lane through entry and exit while the dashboard is open. Confirm the 20-second gap, plan binding, findings, inventory, and alert acknowledgement with the real hardware.

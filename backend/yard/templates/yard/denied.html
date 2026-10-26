@@ -1,0 +1,31 @@
+{% extends 'yard/base_public.html' %}
+
+{% block title %}Access denied{% endblock %}
+{% block page %}denied{% endblock %}
+
+{% block content %}
+<section class="auth-card" aria-labelledby="denied-title">
+  <div class="auth-brand">
+    <span class="brand-mark" aria-hidden="true">▣</span>
+    <div>
+      <h1 id="denied-title">Access denied</h1>
+      <p>Signed in as {{ username }}</p>
+    </div>
+  </div>
+
+  <div class="banner error" role="alert">
+    <strong>{{ code }}</strong>
+    <span>{{ detail }}</span>
+  </div>
+
+  <p class="auth-note">
+    A dashboard account needs an active staff profile attached to an active
+    station. Ask an administrator to correct the account, then sign in again.
+  </p>
+
+  <form method="post" action="{% url 'dashboard:logout' %}">
+    {% csrf_token %}
+    <button class="btn btn-primary btn-block" type="submit">Sign out</button>
+  </form>
+</section>
+{% endblock %}

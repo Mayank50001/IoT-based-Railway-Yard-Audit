@@ -1,0 +1,75 @@
+{% extends 'yard/base.html' %}
+
+{% block title %}Movements{% endblock %}
+{% block page %}movements{% endblock %}
+{% block heading %}Movements{% endblock %}
+{% block subheading %}Every lane crossing grouped into a movement, newest first.{% endblock %}
+
+{% block content %}
+<form id="movement-filters" class="filters" aria-label="Movement filters">
+  <label>
+    State
+    <select name="state">
+      <option value="">All</option>
+      <option value="OPEN">Open</option>
+      <option value="CLOSED">Closed</option>
+    </select>
+  </label>
+  <label>
+    Direction
+    <select name="direction">
+      <option value="">All</option>
+      <option value="ENTRY">Entry</option>
+      <option value="EXIT">Exit</option>
+    </select>
+  </label>
+  <label>
+    Result
+    <select name="result">
+      <option value="">All</option>
+      <option value="VALID">Valid</option>
+      <option value="FLAGGED">Flagged</option>
+      <option value="UNVERIFIED">Unverified</option>
+    </select>
+  </label>
+  <label>
+    Lane
+    <select name="device_id" id="filter-device">
+      <option value="">All lanes</option>
+    </select>
+  </label>
+  <div class="filter-actions">
+    <button class="btn btn-primary" type="submit">Apply</button>
+    <a class="btn btn-ghost" href="{% url 'dashboard:movements' %}">Reset</a>
+  </div>
+</form>
+
+<section class="panel" aria-labelledby="movements-title">
+  <header class="panel-head">
+    <h2 id="movements-title">Movement history</h2>
+    <span class="count-pill" id="movement-count">—</span>
+  </header>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Movement</th>
+          <th>Started</th>
+          <th>Lane</th>
+          <th>Dir</th>
+          <th>State</th>
+          <th>Result</th>
+          <th>Plan</th>
+        </tr>
+      </thead>
+      <tbody id="movement-rows">
+        <tr><td colspan="7" class="empty">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="table-foot">
+    <span class="muted" id="movement-range"></span>
+    <nav class="pager" id="movement-pager" aria-label="Movement pages"></nav>
+  </div>
+</section>
+{% endblock %}

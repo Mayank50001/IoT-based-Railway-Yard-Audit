@@ -1,0 +1,93 @@
+{% extends 'yard/base.html' %}
+
+{% block title %}Movement {{ movement.pk }}{% endblock %}
+{% block page %}movement{% endblock %}
+{% block body_attrs %}data-movement-id="{{ movement.pk }}"{% endblock %}
+{% block heading %}Movement #{{ movement.pk }}{% endblock %}
+{% block subheading %}Loading movement detail…{% endblock %}
+{% block tools %}
+  <a class="btn btn-ghost btn-sm" href="{% url 'dashboard:movements' %}">All movements</a>
+{% endblock %}
+
+{% block content %}
+<section class="panel" aria-labelledby="movement-title">
+  <header class="panel-head">
+    <h2 id="movement-title">Movement</h2>
+    <div id="movement-badges" class="badge-row"></div>
+  </header>
+  <div class="panel-body">
+    <div id="movement-meta" class="meta-grid muted">Loading…</div>
+  </div>
+</section>
+
+<section class="cards" id="counts-board" aria-label="Consist counts">
+  <div class="card"><span class="card-label">Locomotives</span><span class="card-value">—</span></div>
+  <div class="card"><span class="card-label">Coaches</span><span class="card-value">—</span></div>
+  <div class="card"><span class="card-label">Wagons</span><span class="card-value">—</span></div>
+  <div class="card"><span class="card-label">Distinct UIDs</span><span class="card-value">—</span></div>
+</section>
+
+<div class="grid-2">
+  <section class="panel" aria-labelledby="findings-title">
+    <header class="panel-head">
+      <h2 id="findings-title">Findings</h2>
+      <span class="count-pill" id="findings-count">—</span>
+    </header>
+    <div id="movement-findings" class="panel-body muted">Loading…</div>
+  </section>
+
+  <section class="panel" aria-labelledby="alerts-title">
+    <header class="panel-head">
+      <h2 id="alerts-title">Alerts</h2>
+      <span class="count-pill" id="alerts-count">—</span>
+    </header>
+    <div id="movement-alerts" class="panel-body muted">Loading…</div>
+  </section>
+</div>
+
+<section class="panel" aria-labelledby="events-title">
+  <header class="panel-head">
+    <h2 id="events-title">Events</h2>
+    <span class="count-pill" id="events-count">—</span>
+  </header>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Received</th>
+          <th>Kind</th>
+          <th>RFID UID</th>
+          <th>Stock</th>
+          <th>Sequence</th>
+          <th>Passage</th>
+        </tr>
+      </thead>
+      <tbody id="movement-events">
+        <tr><td colspan="6" class="empty">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel" aria-labelledby="effects-title">
+  <header class="panel-head">
+    <h2 id="effects-title">Inventory effects</h2>
+    <span class="count-pill" id="effects-count">—</span>
+  </header>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>RFID UID</th>
+          <th>Before</th>
+          <th>After</th>
+          <th>Applied</th>
+        </tr>
+      </thead>
+      <tbody id="movement-effects">
+        <tr><td colspan="4" class="empty">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,35 @@
+{% extends 'yard/base_public.html' %}
+
+{% block title %}Sign in{% endblock %}
+{% block page %}login{% endblock %}
+
+{% block content %}
+<section class="auth-card" aria-labelledby="login-title">
+  <div class="auth-brand">
+    <span class="brand-mark" aria-hidden="true">▣</span>
+    <div>
+      <h1 id="login-title">Yard Monitor</h1>
+      <p>Railway yard RFID audit</p>
+    </div>
+  </div>
+
+  <form id="login-form" class="auth-form" data-next="{{ next }}" novalidate>
+    <div id="login-error" class="banner error hidden" role="alert"></div>
+
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" autocomplete="username"
+           autocapitalize="none" spellcheck="false" required autofocus>
+
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password"
+           autocomplete="current-password" required>
+
+    <button class="btn btn-primary btn-block" type="submit">Sign in</button>
+  </form>
+
+  <p class="auth-note">
+    Accounts are bound to one station. Lane mode changes and alert
+    acknowledgements are recorded against the signed-in user.
+  </p>
+</section>
+{% endblock %}

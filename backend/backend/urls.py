@@ -23,4 +23,7 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('health', health, name='health'),
     path('api/', include('yard.urls')),
+    # Keep the dashboard last: its root page is the catch-all entry point, and
+    # the API, health, and admin prefixes above must win.
+    path('', include('yard.dashboard_urls')),
 ]

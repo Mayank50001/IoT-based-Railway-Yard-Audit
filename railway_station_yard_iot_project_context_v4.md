@@ -106,6 +106,21 @@ POST /api/alerts/<id>/acknowledge        -> record the operator and time; repeat
 GET  /api/inventory                      -> filters: status, verification, q (UID fragment)
 ```
 
+The operator-facing dashboard is served by Django at the site root and uses those endpoints with the same session cookie:
+
+```text
+GET  /login/             -> sign-in page; an unauthenticated page redirects here with ?next=
+POST /logout/            -> end the session (CSRF-protected form)
+GET  /                   -> overview
+GET  /lanes/             -> lane modes and audited changes
+GET  /movements/         -> filterable movement history
+GET  /movements/<id>/    -> one movement with findings, alerts, events, inventory effects
+GET  /inventory/         -> current yard inventory
+GET  /alerts/            -> alert history and acknowledgement
+```
+
+Pages are thin Django shells; data comes from the read API, so station scoping and validation have one implementation rather than a second copy in templates. A page for another station's movement is a 404 before the browser calls the API. Timestamps are stored in UTC and rendered explicitly in IST. Open data refreshes by polling every 5–10 seconds; a websocket is not required for this prototype.
+
 Movement reads close idle buckets first, so a dashboard without a scheduler never shows a movement that should already have closed. This means some GETs perform a write; that is an accepted prototype trade-off. Read responses never recompute business rules that a stored finding already carries.
 
 ### Device event contract
@@ -401,6 +416,9 @@ Unless otherwise stated, use a plan expecting **1 lead locomotive + 4 coaches**.
 | Operator changes the mode on a disabled lane | HTTP 409 `LANE_INACTIVE`; lane unchanged |
 | Device key sent to a dashboard endpoint | HTTP 401; device credentials do not authenticate a human |
 | Dashboard session sent to ingestion without device keys | HTTP 401 `DEVICE_AUTH_REQUIRED`; a session does not authenticate a device |
+| Dashboard page without a session | HTTP 302 to `/login/?next=<path>`; no yard data is rendered |
+| Dashboard movement page for another station | HTTP 404, identical to a missing movement |
+| Dashboard timestamp | Rendered explicitly in IST while storage remains UTC |
 
 Also test UID normalization, spoofed station/direction fields, disabled devices, exact 20-second boundaries, closure without future events, alert deduplication, and revalidation without repeated inventory transitions.
 
@@ -416,8 +434,9 @@ The earlier hardware acceptance report covers emitted observations/passages, not
 4. Implement movement buckets, the 20-second gap, and idempotent periodic/lazy closure.
 5. Implement direct/fallback plan lookup, distinct RFID composition checks, aggregate ultrasonic warnings, and stored findings.
 6. Apply RFID-primary inventory changes once and expose station-scoped dashboard/history/alert APIs.
-7. Exercise the acceptance scenarios through the same ingestion path with a simulator.
-8. Provide final ESP32 firmware only after the API contract is stable and the missing wiring/clock/transport details have been confirmed.
+7. Provide the Django-served dashboard over those read APIs, including lane-mode control and alert acknowledgement.
+8. Rehearse with the real ESP32 and seeded master data. A simulator is **not** part of the delivery: the demonstration uses physical sensors, and any additional data is seeded. This supersedes the earlier simulator step.
+9. Provide final ESP32 firmware only after the API contract is stable and the missing wiring/clock/transport details have been confirmed. **Delivered as CP-09** in `firmware/`: `main.py`, `logic.py`, `mfrc522.py`, `config.example.py`, 29 hardware-free logic tests, and `README.md`. Wiring is bench-confirmed: SPI bus 2 at 1 MHz with SCK 18, MOSI 23, MISO 19, CS 5, RST 22; HC-SR04 TRIG 26 and ECHO 25. Firmware queued events keep their `event_id` across a reboot, and no `timestamp` is sent until NTP synchronises, so an unsynced device never looks authoritative.
 
 Keep code delivery in chat unless explicit permission to edit code files is given. This documentation revision does not complete any backend implementation milestone.
 
@@ -434,6 +453,6 @@ Backend defaults:
 - `login_throttle_rate = 10/min` per client IP;
 - `session_cookie_age = 12 hours` (one yard shift).
 
-Firmware retains configurable ultrasonic filtering, threshold/hysteresis, minimum occupied/clear intervals, RFID cooldown, and bounded queue/retry settings. A starting same-UID absence/cooldown is 3 seconds; refresh its last-seen time on every successful raw read.
+Firmware retains configurable ultrasonic filtering, threshold/hysteresis, minimum occupied/clear intervals, RFID cooldown, and bounded queue/retry settings. A starting same-UID absence/cooldown is 3 seconds; refresh its last-seen time on every successful raw read. The implemented defaults live in `firmware/config.example.py`: 140 cm enter / 150 cm exit hysteresis, 3 occupied and 4 clear samples, 120 ms minimum passage, 30 s maximum open passage, 3 s UID cooldown, 2000-event queue, batches of 25.
 
 There is **no required RFID-to-ultrasonic pairing window**. Maintain clear gaps for reliable interruption counts and keep evidence within the intended movement bucket; do not reintroduce per-unit correlation as a prerequisite for validation or inventory.

@@ -96,7 +96,8 @@ PLANS = (
         'destination': 'NDLS yard',
     },
     {
-        # Full simulator scenario: 1 locomotive + 4 distinct coaches.
+        # Large arrival: 1 locomotive + 4 distinct coaches. Needs four coach
+        # tags physically presented at the lane, so it is not a bench plan.
         'plan_code': 'NDLS-IN-FULL',
         'direction': Direction.ENTRY,
         'lead': 'WAP7-3020',

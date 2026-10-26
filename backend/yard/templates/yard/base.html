@@ -1,0 +1,65 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>{% block title %}Yard{% endblock %} · {{ station.code }} Yard Monitor</title>
+  <link rel="stylesheet" href="{% static 'yard/dashboard.css' %}">
+</head>
+<body
+  data-page="{% block page %}{% endblock %}"
+  data-can-write="{% if can_write %}true{% else %}false{% endif %}"
+  {% block body_attrs %}{% endblock %}
+>
+  <header class="topbar">
+    <a class="brand" href="{% url 'dashboard:overview' %}">
+      <span class="brand-mark" aria-hidden="true">▣</span>
+      <span class="brand-text">
+        <strong>Yard Monitor</strong>
+        <span class="brand-sub">{{ station.code }} · {{ station.name }}</span>
+      </span>
+    </a>
+
+    <nav class="nav" aria-label="Sections">
+      <a href="{% url 'dashboard:overview' %}" class="{% if active_page == 'overview' %}active{% endif %}">Overview</a>
+      <a href="{% url 'dashboard:lanes' %}" class="{% if active_page == 'lanes' %}active{% endif %}">Lanes</a>
+      <a href="{% url 'dashboard:movements' %}" class="{% if active_page == 'movements' %}active{% endif %}">Movements</a>
+      <a href="{% url 'dashboard:inventory' %}" class="{% if active_page == 'inventory' %}active{% endif %}">Inventory</a>
+      <a href="{% url 'dashboard:alerts' %}" class="{% if active_page == 'alerts' %}active{% endif %}">Alerts</a>
+    </nav>
+
+    <div class="who">
+      <span class="who-text">
+        <span class="who-name">{{ display_name }}</span>
+        <span class="role-badge">{{ role_label }}</span>
+      </span>
+      <form method="post" action="{% url 'dashboard:logout' %}">
+        {% csrf_token %}
+        <button class="btn btn-ghost btn-sm" type="submit">Sign out</button>
+      </form>
+    </div>
+  </header>
+
+  <main class="page">
+    <div class="page-head">
+      <div>
+        <h1>{% block heading %}{% endblock %}</h1>
+        <p class="sub" id="page-sub">{% block subheading %}{% endblock %}</p>
+      </div>
+      <div class="page-tools">
+        <span class="live" id="refresh-status" aria-live="polite">Loading…</span>
+        {% block tools %}{% endblock %}
+      </div>
+    </div>
+
+    <div id="page-error" class="banner error hidden" role="alert"></div>
+
+    {% block content %}{% endblock %}
+  </main>
+
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <script src="{% static 'yard/dashboard.js' %}" defer></script>
+</body>
+</html>

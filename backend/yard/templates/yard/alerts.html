@@ -1,0 +1,59 @@
+{% extends 'yard/base.html' %}
+
+{% block title %}Alerts{% endblock %}
+{% block page %}alerts{% endblock %}
+{% block heading %}Alerts{% endblock %}
+{% block subheading %}Validation exceptions that need an operator's attention.{% endblock %}
+
+{% block content %}
+<form id="alert-filters" class="filters" aria-label="Alert filters">
+  <label>
+    Severity
+    <select name="severity">
+      <option value="">All</option>
+      <option value="WARNING">Warning</option>
+      <option value="CRITICAL">Critical</option>
+    </select>
+  </label>
+  <label>
+    Status
+    <select name="acknowledged">
+      <option value="">All</option>
+      <option value="false">Open</option>
+      <option value="true">Acknowledged</option>
+    </select>
+  </label>
+  <div class="filter-actions">
+    <button class="btn btn-primary" type="submit">Apply</button>
+    <a class="btn btn-ghost" href="{% url 'dashboard:alerts' %}">Reset</a>
+  </div>
+</form>
+
+<section class="panel" aria-labelledby="alerts-title">
+  <header class="panel-head">
+    <h2 id="alerts-title">Alert history</h2>
+    <span class="count-pill" id="alert-count">—</span>
+  </header>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Raised</th>
+          <th>Severity</th>
+          <th>Code</th>
+          <th>Movement</th>
+          <th>Message</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="alert-rows">
+        <tr><td colspan="6" class="empty">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="table-foot">
+    <span class="muted" id="alert-range"></span>
+    <nav class="pager" id="alert-pager" aria-label="Alert pages"></nav>
+  </div>
+</section>
+{% endblock %}

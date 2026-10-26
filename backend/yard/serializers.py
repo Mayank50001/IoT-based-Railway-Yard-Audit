@@ -387,6 +387,7 @@ class MovementSummarySerializer(serializers.ModelSerializer):
             'id',
             'device_id',
             'direction',
+            'direction_source',
             'state',
             'validation_result',
             'plan_code',

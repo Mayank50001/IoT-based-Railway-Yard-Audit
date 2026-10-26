@@ -1,0 +1,76 @@
+{% extends 'yard/base.html' %}
+
+{% block title %}Overview{% endblock %}
+{% block page %}overview{% endblock %}
+{% block heading %}Yard overview{% endblock %}
+{% block subheading %}Live station state. All times are IST.{% endblock %}
+
+{% block content %}
+<section class="cards" aria-label="Station totals">
+  <a class="card card-link" href="{% url 'dashboard:lanes' %}">
+    <span class="card-label">Lanes</span>
+    <span class="card-value" id="stat-lanes">—</span>
+    <span class="card-note" id="stat-lanes-detail">Loading…</span>
+  </a>
+  <a class="card card-link" href="{% url 'dashboard:inventory' %}?status=IN_YARD">
+    <span class="card-label">In yard</span>
+    <span class="card-value" id="stat-inyard">—</span>
+    <span class="card-note">verified and unverified stock</span>
+  </a>
+  <a class="card card-link" href="{% url 'dashboard:inventory' %}?status=OUT">
+    <span class="card-label">Out of yard</span>
+    <span class="card-value" id="stat-out">—</span>
+    <span class="card-note">last known position</span>
+  </a>
+  <a class="card card-link" href="{% url 'dashboard:inventory' %}?verification=UNVERIFIED">
+    <span class="card-label">Unverified</span>
+    <span class="card-value" id="stat-unverified">—</span>
+    <span class="card-note">unknown or inactive tags</span>
+  </a>
+  <a class="card card-link card-alert" href="{% url 'dashboard:alerts' %}?acknowledged=false">
+    <span class="card-label">Open alerts</span>
+    <span class="card-value" id="stat-alerts">—</span>
+    <span class="card-note">awaiting acknowledgement</span>
+  </a>
+</section>
+
+<div class="grid-2">
+  <section class="panel" aria-labelledby="open-title">
+    <header class="panel-head">
+      <h2 id="open-title">Open movements</h2>
+      <span class="count-pill" id="open-count">—</span>
+    </header>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Movement</th>
+            <th>Lane</th>
+            <th>Dir</th>
+            <th>Started</th>
+            <th>Last evidence</th>
+            <th>Plan</th>
+          </tr>
+        </thead>
+        <tbody id="open-movements">
+          <tr><td colspan="6" class="empty">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="latest-title">
+    <header class="panel-head">
+      <h2 id="latest-title">Latest movement</h2>
+    </header>
+    <div id="latest-movement" class="panel-body muted">Loading…</div>
+  </section>
+</div>
+
+<p class="footnote">
+  A movement closes after {{ movement_gap_seconds }} seconds without new evidence.
+  Validation and
+  inventory effects are stored at closure; ultrasonic passages are advisory and
+  never decide the outcome.
+</p>
+{% endblock %}

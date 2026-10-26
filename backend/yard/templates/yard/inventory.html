@@ -1,0 +1,63 @@
+{% extends 'yard/base.html' %}
+
+{% block title %}Inventory{% endblock %}
+{% block page %}inventory{% endblock %}
+{% block heading %}Yard inventory{% endblock %}
+{% block subheading %}Current station-scoped position of every known and unknown tag.{% endblock %}
+
+{% block content %}
+<form id="inventory-filters" class="filters" aria-label="Inventory filters">
+  <label>
+    Status
+    <select name="status">
+      <option value="">All</option>
+      <option value="IN_YARD">In yard</option>
+      <option value="OUT">Out</option>
+    </select>
+  </label>
+  <label>
+    Verification
+    <select name="verification">
+      <option value="">All</option>
+      <option value="VERIFIED">Verified</option>
+      <option value="UNVERIFIED">Unverified</option>
+    </select>
+  </label>
+  <label class="grow">
+    UID contains
+    <input name="q" type="search" maxlength="64" placeholder="e.g. FA37" autocomplete="off">
+  </label>
+  <div class="filter-actions">
+    <button class="btn btn-primary" type="submit">Apply</button>
+    <a class="btn btn-ghost" href="{% url 'dashboard:inventory' %}">Reset</a>
+  </div>
+</form>
+
+<section class="panel" aria-labelledby="inventory-title">
+  <header class="panel-head">
+    <h2 id="inventory-title">Inventory records</h2>
+    <span class="count-pill" id="inventory-count">—</span>
+  </header>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>RFID UID</th>
+          <th>Rolling stock</th>
+          <th>Status</th>
+          <th>Verification</th>
+          <th>Since</th>
+          <th>Last movement</th>
+        </tr>
+      </thead>
+      <tbody id="inventory-rows">
+        <tr><td colspan="6" class="empty">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="table-foot">
+    <span class="muted" id="inventory-range"></span>
+    <nav class="pager" id="inventory-pager" aria-label="Inventory pages"></nav>
+  </div>
+</section>
+{% endblock %}

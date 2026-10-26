@@ -1,0 +1,44 @@
+{% extends 'yard/base.html' %}
+
+{% block title %}Lanes{% endblock %}
+{% block page %}lanes{% endblock %}
+{% block heading %}Lanes{% endblock %}
+{% block subheading %}A lane is a physical crossing point. Its direction is an operator decision.{% endblock %}
+
+{% block content %}
+<section class="panel" aria-labelledby="lanes-title">
+  <header class="panel-head">
+    <h2 id="lanes-title">Station lanes</h2>
+    <span class="count-pill" id="lane-count">—</span>
+  </header>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Lane</th>
+          <th>Mode</th>
+          <th>Status</th>
+          <th>Open movement</th>
+          <th>Set direction</th>
+        </tr>
+      </thead>
+      <tbody id="lane-rows">
+        <tr><td colspan="5" class="empty">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+{% if can_write %}
+<p class="footnote">
+  A change made while a movement is open applies to the next movement. The open
+  movement keeps its original direction, and every change is recorded with your
+  username.
+</p>
+{% else %}
+<p class="footnote">
+  Your role is read-only. Lane modes are changed by a yard master or station
+  administrator.
+</p>
+{% endif %}
+{% endblock %}
